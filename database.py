@@ -2,13 +2,21 @@ import os
 import pandas as pd
 import random
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DB_URL = os.getenv("DB_URL", "sqlite:///mock_business.sqlite3")
 engine = create_engine(DB_URL)
+
+# Separate engine for running generated SQL: SQLite itself refuses every write on it,
+# so a statement the text check misses (e.g. WITH ... DELETE) still cannot change data.
+read_engine = create_engine(DB_URL)
+
+@event.listens_for(read_engine, "connect")
+def _make_read_only(dbapi_connection, connection_record):
+    dbapi_connection.execute("PRAGMA query_only = ON")
 
 def init_db():
     print("Initializing mock database...")
@@ -74,7 +82,7 @@ def execute_sql(query: str):
         return None, "Security Error: Multiple SQL statements are not allowed."
 
     try:
-        with engine.connect() as conn:
+        with read_engine.connect() as conn:
             df = pd.read_sql(text(query), conn)
         return df, None
     except Exception as e:
