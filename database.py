@@ -62,12 +62,20 @@ def get_schema_for_llm():
     return "\n\n".join(schema_info)
 
 def execute_sql(query: str):
+    """Executes only read-only SELECT or WITH queries against the SQLite database."""
+    clean_query = query.strip().upper()
+    
+    # Deterministic read-only check before hitting the database
+    if not (clean_query.startswith("SELECT") or clean_query.startswith("WITH")):
+        return None, "Security Error: Only read-only SELECT/WITH queries are permitted."
+    
+    # Block multi-statement injection via semicolons
+    if ";" in query.strip()[:-1]:
+        return None, "Security Error: Multiple SQL statements are not allowed."
+
     try:
         with engine.connect() as conn:
             df = pd.read_sql(text(query), conn)
         return df, None
     except Exception as e:
         return None, str(e)
-
-# Ensures tables exist immediately upon import
-check_and_seed_db()

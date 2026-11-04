@@ -20,7 +20,11 @@ uploaded_file = st.sidebar.file_uploader("Upload a CSV to query", type=["csv"])
 if uploaded_file is not None:
     try:
         df = pd.read_csv(uploaded_file)
-        table_name = uploaded_file.name.replace('.csv', '').replace(' ', '_').lower()
+        raw_name = uploaded_file.name.replace('.csv', '').replace(' ', '_').lower()
+        # Prevent overwriting core seeded tables
+        protected_tables = {"customers", "products", "orders"}
+        table_name = f"user_{raw_name}" if raw_name in protected_tables else raw_name
+        
         df.to_sql(name=table_name, con=engine, if_exists='replace', index=False)
         st.sidebar.success(f"✅ Uploaded as table: '{table_name}'")
         with st.sidebar.expander("Preview Data"):
