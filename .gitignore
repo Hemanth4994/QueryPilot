@@ -7,3 +7,5 @@ __pycache__/
 *.db
 data/
 .pytest_cache/
+.ruff_cache/
+evals/reports/

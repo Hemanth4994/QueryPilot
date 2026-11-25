@@ -4,9 +4,11 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 .env
 *.sqlite3
 *.sqlite
 *.db
 data/
 tests/
+evals/reports/

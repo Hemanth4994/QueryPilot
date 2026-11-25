@@ -1,0 +1,96 @@
+name: QueryPilot CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Ruff Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Run ruff check
+        run: ruff check .
+
+  test-and-eval:
+    name: Pytest & Offline Golden Eval
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: querypilot
+          POSTGRES_PASSWORD: querypilot
+          POSTGRES_DB: querypilot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U querypilot -d querypilot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET_KEY: ci-only-ephemeral-signing-key-not-for-prod-32b
+      ENABLE_TRACING: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install backend and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt pytest fakeredis
+
+      - name: Run pytest suite
+        run: pytest -v
+
+      - name: Run offline 30-query golden evaluation against Postgres
+        run: python evals/run_eval.py --mode offline
+
+  docker:
+    name: Docker Compose & Image Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: docker compose config > /dev/null
+
+      - name: Build backend image
+        run: docker build -t querypilot-backend:ci ./backend
+
+      - name: Build frontend image
+        run: docker build -t querypilot-frontend:ci ./frontend

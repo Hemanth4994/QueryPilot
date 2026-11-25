@@ -1,4 +1,40 @@
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: querypilot-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-querypilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-querypilot}
+      POSTGRES_DB: ${POSTGRES_DB:-querypilot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-querypilot} -d ${POSTGRES_DB:-querypilot}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: querypilot-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -11,11 +47,31 @@ services:
         required: false
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      DATABASE_URL: sqlite:////app/data/mock_business.sqlite3
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-querypilot}:${POSTGRES_PASSWORD:-querypilot}@db:5432/${POSTGRES_DB:-querypilot}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      ASYNC_UPLOAD_THRESHOLD_BYTES: ${ASYNC_UPLOAD_THRESHOLD_BYTES:-524288}
+      ENABLE_TRACING: ${ENABLE_TRACING:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-querypilot-backend}
       API_HOST: 0.0.0.0
       PORT: 8000
-    volumes:
-      - sqlite_data:/app/data
+      PRIMARY_MODEL: ${PRIMARY_MODEL:-gemini-3.6-flash}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-gemini-3.5-flash}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
+      SCHEMA_RAG_TOP_K: ${SCHEMA_RAG_TOP_K:-5}
+      SCHEMA_RAG_MIN_SIMILARITY: ${SCHEMA_RAG_MIN_SIMILARITY:-0.35}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-10000}
+      MAX_QUERY_ROWS: ${MAX_QUERY_ROWS:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -27,7 +83,41 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: querypilot-worker
+    command: ["arq", "app.worker.WorkerSettings"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-querypilot}:${POSTGRES_PASSWORD:-querypilot}@db:5432/${POSTGRES_DB:-querypilot}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      ENABLE_TRACING: ${ENABLE_TRACING:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-querypilot-worker}
+      PRIMARY_MODEL: ${PRIMARY_MODEL:-gemini-3.6-flash}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-gemini-3.5-flash}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
+      SCHEMA_RAG_TOP_K: ${SCHEMA_RAG_TOP_K:-5}
+      SCHEMA_RAG_MIN_SIMILARITY: ${SCHEMA_RAG_MIN_SIMILARITY:-0.35}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-10000}
+      MAX_QUERY_ROWS: ${MAX_QUERY_ROWS:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -57,4 +147,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  sqlite_data:
+  pg_data:

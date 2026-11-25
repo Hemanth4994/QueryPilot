@@ -1,51 +1,284 @@
-"""Versioned v1 FastAPI routes for QueryPilot."""
+"""Versioned v1 FastAPI routes with JWT auth, Redis cache, rate limit, ARQ, and metrics."""
 
-from fastapi import APIRouter, File, UploadFile
+import base64
+import time
+import uuid
 
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from starlette.concurrency import run_in_threadpool
+
+from ..config import settings
 from ..core.agent import run_query_pipeline
-from ..core.database import get_schema_for_llm, get_structured_schema
+from ..core.auth import (
+    User,
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    register_user,
+)
+from ..core.cache import (
+    check_redis_health,
+    compute_schema_hash,
+    enforce_rate_limit,
+    get_cached_query,
+    get_cached_schema,
+    get_job_state,
+    invalidate_user_cache,
+    save_job_state,
+    set_cached_query,
+    set_cached_schema,
+)
+from ..core.database import get_engine, get_schema_for_llm, get_structured_schema
 from ..core.ingestion import ingest_csv_bytes
+from ..core.schema_rag import index_all_tables
+from ..core.telemetry import (
+    QueryTelemetryEvent,
+    emit_query_telemetry,
+    metrics_registry,
+)
 from ..schemas import (
+    AuthTokenResponse,
     HealthResponse,
+    JobStatusResponse,
+    JobSubmittedResponse,
+    MetricsResponse,
     QueryRequest,
     QueryResponse,
+    ReindexResponse,
     SchemaResponse,
     TableSchema,
     UploadResponse,
+    UserCredentialsRequest,
+    UserResponse,
 )
+from ..worker import get_arq_pool
 
 router = APIRouter(prefix="/api/v1", tags=["querypilot-v1"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health_check() -> HealthResponse:
-    """Verify service health and inspect active database table readiness."""
-    tables = get_structured_schema()
+async def health_check() -> HealthResponse:
+    """Verify PostgreSQL and Redis readiness alongside shared schema table count."""
+    def _db_probe() -> list[dict]:
+        with get_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return get_structured_schema(user_id=None)
+
+    tables = await run_in_threadpool(_db_probe)
+    redis_ready = await check_redis_health()
     return HealthResponse(
         status="ok",
         database_ready=len(tables) >= 3,
+        redis_ready=redis_ready,
         tables_count=len(tables),
     )
 
 
+@router.get("/metrics", response_model=MetricsResponse)
+async def get_metrics(current_user: User = Depends(get_current_user)) -> MetricsResponse:
+    """Return live telemetry counters for authenticated monitoring."""
+    _ = current_user
+    return MetricsResponse(**metrics_registry.snapshot())
+
+
+@router.post("/auth/register", response_model=AuthTokenResponse, status_code=status.HTTP_201_CREATED)
+async def register(payload: UserCredentialsRequest) -> AuthTokenResponse:
+    """Register a new user account and issue a Bearer JWT access token."""
+    user = await run_in_threadpool(register_user, payload.email, payload.password)
+    token, expires_in = create_access_token(user.id, user.email)
+    return AuthTokenResponse(
+        access_token=token,
+        expires_in=expires_in,
+        user=UserResponse(id=user.id, email=user.email, created_at=user.created_at),
+    )
+
+
+@router.post("/auth/login", response_model=AuthTokenResponse)
+async def login(payload: UserCredentialsRequest) -> AuthTokenResponse:
+    """Authenticate credentials and issue a Bearer JWT access token."""
+    user = await run_in_threadpool(authenticate_user, payload.email, payload.password)
+    token, expires_in = create_access_token(user.id, user.email)
+    return AuthTokenResponse(
+        access_token=token,
+        expires_in=expires_in,
+        user=UserResponse(id=user.id, email=user.email, created_at=user.created_at),
+    )
+
+
+@router.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
+    """Return the currently authenticated user profile."""
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        created_at=current_user.created_at,
+    )
+
+
 @router.get("/schema", response_model=SchemaResponse)
-def get_schema() -> SchemaResponse:
-    """Return active SQLite tables and columns."""
-    tables = [TableSchema(**tbl) for tbl in get_structured_schema()]
-    return SchemaResponse(tables=tables, schema_text=get_schema_for_llm())
+async def get_schema(current_user: User = Depends(get_current_user)) -> SchemaResponse:
+    """Return tenant-visible tables and columns, backed by per-user Redis caching."""
+    cached = await get_cached_schema(current_user.id)
+    if cached is not None:
+        return SchemaResponse(**cached)
+
+    def _load_schema() -> dict:
+        tables = [TableSchema(**tbl) for tbl in get_structured_schema(user_id=current_user.id)]
+        schema_text = get_schema_for_llm(user_id=current_user.id)
+        return SchemaResponse(tables=tables, schema_text=schema_text).model_dump(mode="json")
+
+    payload = await run_in_threadpool(_load_schema)
+    await set_cached_schema(current_user.id, payload)
+    return SchemaResponse(**payload)
+
+
+@router.post("/schema/reindex", response_model=ReindexResponse)
+async def reindex_schema(current_user: User = Depends(get_current_user)) -> ReindexResponse:
+    """Rebuild Schema RAG embeddings for shared and current user's tables and clear cache."""
+    summary = await run_in_threadpool(index_all_tables, True, current_user.id)
+    await invalidate_user_cache(current_user.id)
+    return ReindexResponse(**summary)
 
 
 @router.post("/query", response_model=QueryResponse)
-def query_data(payload: QueryRequest) -> QueryResponse:
-    """Translate a natural-language question to read-only SQL, execute, and chart."""
-    return run_query_pipeline(payload.question)
+async def query_data(
+    payload: QueryRequest,
+    current_user: User = Depends(get_current_user),
+) -> QueryResponse:
+    """Rate-limit, check per-user Redis query cache, or execute tenant-scoped Schema RAG."""
+    request_id = uuid.uuid4().hex
+    req_start = time.perf_counter()
+    await enforce_rate_limit(current_user.id, scope="api")
+
+    schema_text = await run_in_threadpool(get_schema_for_llm, None, current_user.id)
+    schema_hash = compute_schema_hash(schema_text)
+
+    cached = await get_cached_query(current_user.id, schema_hash, payload.question)
+    if cached is not None:
+        cached["request_id"] = request_id
+        cached["latency_ms"] = round((time.perf_counter() - req_start) * 1000, 2)
+        cached_resp = QueryResponse(**cached)
+        emit_query_telemetry(
+            QueryTelemetryEvent(
+                request_id=request_id,
+                user_id=current_user.id,
+                model_used=cached_resp.model,
+                fallback_triggered=cached_resp.fallback_triggered,
+                self_correction_attempts=cached_resp.self_correction_attempts,
+                cache_hit=True,
+                retrieved_tables=cached_resp.retrieved_tables,
+                sql_guard_status=cached_resp.sql_guard_status,
+                latency_ms=cached_resp.latency_ms,
+                input_tokens=0,
+                output_tokens=0,
+            )
+        )
+        return cached_resp
+
+    result = await run_in_threadpool(
+        run_query_pipeline,
+        payload.question,
+        current_user.id,
+        request_id,
+    )
+    await set_cached_query(
+        current_user.id,
+        schema_hash,
+        payload.question,
+        result.model_dump(mode="json"),
+    )
+    return result
 
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
-    """Upload a CSV file into SQLite with protected core-table prefixing."""
+@router.post(
+    "/query/async",
+    response_model=JobSubmittedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def query_data_async(
+    payload: QueryRequest,
+    current_user: User = Depends(get_current_user),
+) -> JobSubmittedResponse:
+    """Enqueue an analytical query on the ARQ Redis worker queue."""
+    await enforce_rate_limit(current_user.id, scope="api")
+    pool = await get_arq_pool()
+    job_id = uuid.uuid4().hex
+    await save_job_state(
+        job_id=job_id,
+        user_id=current_user.id,
+        job_type="query",
+        job_status="queued",
+    )
+    await pool.enqueue_job("run_async_query_job", job_id, current_user.id, payload.question)
+    return JobSubmittedResponse(job_id=job_id, job_type="query", status="queued")
+
+
+@router.post(
+    "/upload",
+    response_model=UploadResponse | JobSubmittedResponse,
+)
+async def upload_csv(
+    file: UploadFile = File(...),
+    async_mode: bool = Query(default=False, description="Enqueue CSV ingestion in worker."),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a tenant-scoped CSV synchronously or enqueue large files to the worker."""
+    await enforce_rate_limit(current_user.id, scope="api")
+
     filename = file.filename or "uploaded.csv"
     if not filename.lower().endswith(".csv"):
         raise ValueError("Only .csv files are supported.")
     content = await file.read()
-    return ingest_csv_bytes(content=content, filename=filename)
+    if not content:
+        raise ValueError("Uploaded CSV file is empty.")
+
+    if async_mode or len(content) > settings.async_upload_threshold_bytes:
+        pool = await get_arq_pool()
+        job_id = uuid.uuid4().hex
+        await save_job_state(
+            job_id=job_id,
+            user_id=current_user.id,
+            job_type="upload",
+            job_status="queued",
+        )
+        content_b64 = base64.b64encode(content).decode("ascii")
+        await pool.enqueue_job(
+            "run_async_upload_job",
+            job_id,
+            current_user.id,
+            filename,
+            content_b64,
+        )
+        accepted = JobSubmittedResponse(job_id=job_id, job_type="upload", status="queued")
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=accepted.model_dump())
+
+    result = await run_in_threadpool(ingest_csv_bytes, content, filename, current_user.id)
+    await invalidate_user_cache(current_user.id)
+    return result
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+) -> JobStatusResponse:
+    """Return status and result for a background job owned by the authenticated user."""
+    job = await get_job_state(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    if int(job["user_id"]) != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorized to access this job.",
+        )
+    return JobStatusResponse(
+        job_id=job["job_id"],
+        job_type=job["job_type"],
+        status=job["status"],
+        result=job.get("result"),
+        error=job.get("error"),
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
