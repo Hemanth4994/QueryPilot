@@ -1,0 +1,1 @@
+"""QueryPilot FastAPI backend package."""
