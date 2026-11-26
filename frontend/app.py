@@ -23,7 +23,7 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def _clear_auth_session() -> None:
+def _clear_auth_session(notice: str | None = None) -> None:
     """Clear auth credentials and tenant-scoped session caches on logout or 401."""
     for key in (
         "access_token",
@@ -33,15 +33,110 @@ def _clear_auth_session() -> None:
         "last_upload_result",
     ):
         st.session_state.pop(key, None)
+    if notice:
+        st.session_state["auth_notice"] = notice
+
+
+def _extract_error_message(response: httpx.Response, fallback: str) -> str:
+    """Extract a readable string message from FastAPI JSON or 422 validation lists."""
+    try:
+        payload = response.json()
+    except ValueError:
+        text_body = response.text.strip()
+        return text_body or fallback
+
+    if isinstance(payload, dict):
+        detail = payload.get("detail", payload.get("message"))
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        if isinstance(detail, list):
+            parts: list[str] = []
+            for item in detail:
+                if isinstance(item, dict):
+                    loc = item.get("loc") or []
+                    field = str(loc[-1]) if loc else "input"
+                    msg = str(item.get("msg") or "Invalid value").removeprefix("Value error, ")
+                    parts.append(f"{field}: {msg}" if field != "body" else msg)
+                else:
+                    parts.append(str(item))
+            if parts:
+                return "; ".join(parts)
+    return fallback
 
 
 def _handle_auth_status(response: httpx.Response) -> bool:
-    """Return True if request failed with 401 and cleared session state."""
+    """Return True if request failed with 401, clear state, and redirect to sign-in."""
     if response.status_code == 401:
-        _clear_auth_session()
-        st.warning("Your session expired or is invalid. Please sign in again.")
+        _clear_auth_session("Your session expired or is invalid. Please sign in again.")
+        st.rerun()
         return True
     return False
+
+
+def _fetch_backend_health() -> dict | None:
+    """Probe backend health endpoint without requiring authentication."""
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/api/v1/health", timeout=3.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return None
+
+
+def _validate_auth_inputs(
+    email: str,
+    password: str,
+    confirm_password: str | None = None,
+) -> tuple[str, str | None]:
+    """Validate email/password inputs locally before calling auth endpoints."""
+    cleaned_email = email.strip().lower()
+    if "@" not in cleaned_email or "." not in cleaned_email.split("@", 1)[-1]:
+        return cleaned_email, "Please enter a valid email address (for example, name@company.com)."
+    if not password:
+        return cleaned_email, "Please enter your password."
+    if confirm_password is not None:
+        if len(password) < 8:
+            return cleaned_email, "Password must be at least 8 characters long."
+        if password != confirm_password:
+            return cleaned_email, "Passwords do not match."
+    return cleaned_email, None
+
+
+def _submit_auth(
+    mode: str,
+    email: str,
+    password: str,
+    confirm_password: str | None = None,
+) -> str | None:
+    """Validate inputs, authenticate against /api/v1/auth/{mode}, and populate session."""
+    cleaned_email, validation_error = _validate_auth_inputs(email, password, confirm_password)
+    if validation_error:
+        return validation_error
+
+    try:
+        resp = httpx.post(
+            f"{BACKEND_URL}/api/v1/auth/{mode}",
+            json={"email": cleaned_email, "password": password},
+            timeout=15.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Unable to reach authentication service at {BACKEND_URL}: {exc}"
+
+    if resp.status_code >= 400:
+        fallback = "Sign in failed." if mode == "login" else "Account creation failed."
+        detail = _extract_error_message(resp, fallback)
+        if mode == "login" and resp.status_code == 401:
+            return f"{detail} If this is your first time here, open the Create Account tab first."
+        if mode == "register" and resp.status_code == 409:
+            return f"{detail} Switch to the Sign In tab to log in."
+        return detail
+
+    auth_data = resp.json()
+    _clear_auth_session()
+    st.session_state["access_token"] = auth_data["access_token"]
+    st.session_state["user_email"] = auth_data["user"]["email"]
+    return None
 
 
 def fetch_schema() -> dict | None:
@@ -60,6 +155,17 @@ def fetch_schema() -> dict | None:
         return None
 
 
+def _parse_json_or_raise(response: httpx.Response, context: str) -> dict:
+    """Safely decode a JSON object response or raise RuntimeError with helpful detail."""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{context}: backend returned non-JSON response ({response.status_code}).") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: unexpected payload format from backend.")
+    return data
+
+
 def poll_job_until_complete(job_id: str, timeout_seconds: float = 120.0) -> dict | None:
     """Poll GET /api/v1/jobs/{job_id} until the ARQ worker finishes or times out."""
     deadline = time.monotonic() + timeout_seconds
@@ -71,11 +177,12 @@ def poll_job_until_complete(job_id: str, timeout_seconds: float = 120.0) -> dict
         )
         if _handle_auth_status(resp):
             return None
-        resp.raise_for_status()
-        job = resp.json()
-        if job["status"] == "completed":
+        if resp.status_code >= 400:
+            raise RuntimeError(_extract_error_message(resp, f"Job polling failed ({resp.status_code})."))
+        job = _parse_json_or_raise(resp, "Job polling")
+        if job.get("status") == "completed":
             return job.get("result")
-        if job["status"] == "failed":
+        if job.get("status") == "failed":
             raise RuntimeError(job.get("error") or "Background job failed.")
         time.sleep(0.5)
     raise TimeoutError("Background job timed out while waiting for completion.")
@@ -101,66 +208,99 @@ def _render_query_details(
         st.caption(caption)
 
 
-# Sidebar Authentication Gate
+# Main Authentication Page
 if not st.session_state.get("access_token"):
-    st.sidebar.header("🔐 Account Sign In")
-    login_tab, register_tab = st.sidebar.tabs(["Login", "Register"])
+    health = _fetch_backend_health()
+    with st.sidebar:
+        st.header("QueryPilot Workspace")
+        st.caption(
+            "Multi-tenant Text-to-SQL BI agent with pgvector Schema RAG, Redis cache, and ARQ workers."
+        )
+        if health and health.get("database_ready"):
+            redis_label = "Redis ready" if health.get("redis_ready") else "Redis bypassed"
+            st.success(f"API connected · {health.get('tables_count', 3)} shared tables · {redis_label}")
+        else:
+            st.warning(f"Backend status check unreachable at `{BACKEND_URL}`.")
 
-    with login_tab:
-        with st.form("login_form"):
-            login_email = st.text_input("Email", key="login_email")
-            login_password = st.text_input("Password", type="password", key="login_password")
-            login_submitted = st.form_submit_button("Sign In", use_container_width=True)
-        if login_submitted:
-            try:
-                resp = httpx.post(
-                    f"{BACKEND_URL}/api/v1/auth/login",
-                    json={"email": login_email, "password": login_password},
-                    timeout=15.0,
-                )
-                if resp.status_code >= 400:
-                    st.sidebar.error(resp.json().get("detail", "Login failed."))
-                else:
-                    auth_data = resp.json()
-                    st.session_state["access_token"] = auth_data["access_token"]
-                    st.session_state["user_email"] = auth_data["user"]["email"]
-                    st.rerun()
-            except httpx.HTTPError as exc:
-                st.sidebar.error(f"Connection error: {exc}")
-
-    with register_tab:
-        with st.form("register_form"):
-            reg_email = st.text_input("Email", key="reg_email")
-            reg_password = st.text_input(
-                "Password (min 8 chars)",
-                type="password",
-                key="reg_password",
+    _, auth_col, _ = st.columns([1, 1.8, 1])
+    with auth_col:
+        with st.container(border=True):
+            st.subheader("🔐 Sign in to QueryPilot")
+            st.caption(
+                "Sign in to access the shared B2B demo dataset (`customers`, `products`, `orders`) "
+                "and your private CSV workspaces."
             )
-            reg_submitted = st.form_submit_button("Create Account", use_container_width=True)
-        if reg_submitted:
-            try:
-                resp = httpx.post(
-                    f"{BACKEND_URL}/api/v1/auth/register",
-                    json={"email": reg_email, "password": reg_password},
-                    timeout=15.0,
-                )
-                if resp.status_code >= 400:
-                    st.sidebar.error(resp.json().get("detail", "Registration failed."))
-                else:
-                    auth_data = resp.json()
-                    st.session_state["access_token"] = auth_data["access_token"]
-                    st.session_state["user_email"] = auth_data["user"]["email"]
-                    st.rerun()
-            except httpx.HTTPError as exc:
-                st.sidebar.error(f"Connection error: {exc}")
 
-    st.info("Please sign in or register in the sidebar to query data and upload custom CSVs.")
+            auth_notice = st.session_state.pop("auth_notice", None)
+            if auth_notice:
+                st.warning(auth_notice)
+
+            signin_tab, register_tab = st.tabs(["Sign In", "Create Account"])
+
+            with signin_tab:
+                st.caption("Existing user? Enter your email and password below.")
+                with st.form("login_form"):
+                    login_email = st.text_input(
+                        "Email",
+                        placeholder="you@company.com",
+                        key="signin_email",
+                    )
+                    login_password = st.text_input(
+                        "Password",
+                        type="password",
+                        placeholder="Enter your password",
+                        key="signin_password",
+                    )
+                    login_submitted = st.form_submit_button(
+                        "Sign In",
+                        type="primary",
+                        width="stretch",
+                    )
+                if login_submitted:
+                    err = _submit_auth("login", login_email, login_password)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+
+            with register_tab:
+                st.caption("First time here? Create your private workspace account.")
+                with st.form("register_form"):
+                    reg_email = st.text_input(
+                        "Email",
+                        placeholder="you@company.com",
+                        key="signup_email",
+                    )
+                    reg_password = st.text_input(
+                        "Password (minimum 8 characters)",
+                        type="password",
+                        placeholder="At least 8 characters",
+                        key="signup_password",
+                    )
+                    reg_confirm = st.text_input(
+                        "Confirm Password",
+                        type="password",
+                        placeholder="Re-enter your password",
+                        key="signup_confirm",
+                    )
+                    reg_submitted = st.form_submit_button(
+                        "Create Account",
+                        type="primary",
+                        width="stretch",
+                    )
+                if reg_submitted:
+                    err = _submit_auth("register", reg_email, reg_password, confirm_password=reg_confirm)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+
     st.stop()
 
 
 # Authenticated Sidebar
 st.sidebar.caption(f"👤 Signed in as **{st.session_state.get('user_email', 'user')}**")
-if st.sidebar.button("Sign Out", use_container_width=True):
+if st.sidebar.button("Sign Out", width="stretch"):
     _clear_auth_session()
     st.rerun()
 
@@ -188,25 +328,31 @@ if uploaded_file is not None:
                 if _handle_auth_status(resp):
                     st.stop()
                 if resp.status_code == 429:
-                    st.sidebar.warning(resp.json().get("detail", "Rate limit exceeded."))
+                    st.sidebar.warning(_extract_error_message(resp, "Rate limit exceeded."))
                 elif resp.status_code >= 400:
-                    detail = resp.json().get("detail", resp.text)
+                    detail = _extract_error_message(resp, "Upload failed.")
                     st.sidebar.error(f"Upload failed: {detail}")
                 elif resp.status_code == 202:
-                    job_info = resp.json()
+                    job_info = _parse_json_or_raise(resp, "Async upload")
                     upload_payload = poll_job_until_complete(job_info["job_id"])
                     if upload_payload is not None:
                         st.session_state["last_upload_signature"] = file_signature
                         st.session_state["last_upload_result"] = upload_payload
                 else:
                     st.session_state["last_upload_signature"] = file_signature
-                    st.session_state["last_upload_result"] = resp.json()
+                    st.session_state["last_upload_result"] = _parse_json_or_raise(resp, "CSV upload")
         except (httpx.HTTPError, RuntimeError, TimeoutError) as exc:
             st.sidebar.error(f"Upload failed: {exc}")
 
     upload_result = st.session_state.get("last_upload_result")
     if upload_result and st.session_state.get("last_upload_signature") == file_signature:
-        st.sidebar.success(f"✅ Uploaded & indexed table: '{upload_result['table_name']}'")
+        if upload_result.get("embedding_indexed", True):
+            st.sidebar.success(f"✅ Uploaded & indexed table: '{upload_result['table_name']}'")
+        else:
+            st.sidebar.warning(
+                f"⚠️ Saved table '{upload_result['table_name']}', but Schema RAG indexing failed. "
+                "Click Reindex Schema RAG once Gemini API is available."
+            )
         with st.sidebar.expander("Preview Data"):
             preview_df = pd.DataFrame(upload_result["preview"], columns=upload_result["columns"])
             st.dataframe(preview_df)
@@ -230,7 +376,7 @@ with st.sidebar.expander("🗄️ Active Database Schema"):
     else:
         st.caption("Backend schema unavailable.")
 
-    if st.button("🔄 Reindex Schema RAG", use_container_width=True):
+    if st.button("🔄 Reindex Schema RAG", width="stretch"):
         try:
             reindex_resp = httpx.post(
                 f"{BACKEND_URL}/api/v1/schema/reindex",
@@ -239,10 +385,12 @@ with st.sidebar.expander("🗄️ Active Database Schema"):
             )
             if _handle_auth_status(reindex_resp):
                 st.stop()
-            reindex_resp.raise_for_status()
-            info = reindex_resp.json()
-            st.success(f"Indexed {info['total_tables']} table(s).")
-        except httpx.HTTPError as exc:
+            if reindex_resp.status_code >= 400:
+                st.error(_extract_error_message(reindex_resp, "Reindex failed."))
+            else:
+                info = _parse_json_or_raise(reindex_resp, "Schema reindex")
+                st.success(f"Indexed {info['total_tables']} table(s).")
+        except (httpx.HTTPError, RuntimeError) as exc:
             st.error(f"Reindex failed: {exc}")
 
 if "messages" not in st.session_state:
@@ -264,7 +412,7 @@ for message in st.session_state.messages:
         if message.get("data") is not None:
             st.dataframe(message["data"])
         if message.get("chart") is not None:
-            st.plotly_chart(message["chart"], use_container_width=True)
+            st.plotly_chart(message["chart"], width="stretch")
 
 prompt = st.chat_input("Ask a question about your data...")
 
@@ -292,24 +440,24 @@ if prompt:
                     st.stop()
 
                 if api_response.status_code == 429:
-                    detail = api_response.json().get("detail", "Rate limit exceeded.")
+                    detail = _extract_error_message(api_response, "Rate limit exceeded.")
                     st.warning(detail)
                     st.session_state.messages.append(
                         {"role": "assistant", "content": f"Rate limited: {detail}"}
                     )
                     result = None
                 elif api_response.status_code >= 400:
-                    detail = api_response.json().get("detail", api_response.text)
+                    detail = _extract_error_message(api_response, "API request failed.")
                     st.error(f"API Error ({api_response.status_code}): {detail}")
                     st.session_state.messages.append(
                         {"role": "assistant", "content": f"Failed: {detail}"}
                     )
                     result = None
                 elif api_response.status_code == 202:
-                    job_info = api_response.json()
+                    job_info = _parse_json_or_raise(api_response, "Async query")
                     result = poll_job_until_complete(job_info["job_id"])
                 else:
-                    result = api_response.json()
+                    result = _parse_json_or_raise(api_response, "Query response")
             except (httpx.HTTPError, RuntimeError, TimeoutError) as exc:
                 err_msg = f"Backend execution error: {exc}"
                 st.error(err_msg)
@@ -375,7 +523,10 @@ if prompt:
                     df = pd.DataFrame(result["rows"], columns=result["columns"])
                     fig = None
                     if result.get("plotly_json"):
-                        fig = pio.from_json(json.dumps(result["plotly_json"]))
+                        try:
+                            fig = pio.from_json(json.dumps(result["plotly_json"]))
+                        except Exception:
+                            fig = None
 
                     st.markdown(response_text)
                     _render_query_details(
@@ -387,7 +538,7 @@ if prompt:
                     )
                     st.dataframe(df)
                     if fig is not None:
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                     st.session_state.messages.append(
                         {

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any
 
 import pandas as pd
@@ -226,7 +227,7 @@ def run_offline_eval(cases: list[dict[str, Any]]) -> dict[str, Any]:
     return _summarize_report(mode="offline", results=results)
 
 
-def run_live_eval(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def run_live_eval(cases: list[dict[str, Any]], delay_seconds: float = 0.0) -> dict[str, Any]:
     """Run all 30 prompts live against Gemini + Schema RAG and score Execution Accuracy."""
     llm_client.reset_genai_client()
     index_all_tables(force=False, user_id=None)
@@ -239,9 +240,26 @@ def run_live_eval(cases: list[dict[str, Any]]) -> dict[str, Any]:
     total_input_tokens = 0
     total_output_tokens = 0
 
-    for case in cases:
+    for idx, case in enumerate(cases):
+        if idx > 0 and delay_seconds > 0:
+            time.sleep(delay_seconds)
         expected_status = case["expected_status"]
-        resp = run_query_pipeline(case["question"], user_id=1, emit_telemetry=True)
+        try:
+            resp = run_query_pipeline(case["question"], user_id=1, emit_telemetry=True)
+        except Exception as exc:
+            results.append(
+                {
+                    "id": case["id"],
+                    "category": case["category"],
+                    "passed": False,
+                    "detail": f"Pipeline exception: {exc}",
+                    "latency_ms": 0.0,
+                    "corrected": False,
+                    "model": None,
+                }
+            )
+            continue
+
         latencies.append(resp.latency_ms)
         if resp.corrected:
             self_corrections += 1
@@ -301,6 +319,10 @@ def run_live_eval(cases: list[dict[str, Any]]) -> dict[str, Any]:
         mode="live",
         results=results,
         extra_metrics={
+            "primary_model": settings.primary_model,
+            "fallback_model": settings.fallback_model,
+            "embedding_model": settings.embedding_model,
+            "database_dialect": "postgresql" if is_postgres() else "sqlite",
             "self_correction_rate": round(self_corrections / total, 4) if total else 0.0,
             "self_corrections": self_corrections,
             "fallback_count": fallback_count,
@@ -367,6 +389,8 @@ def write_reports(report: dict[str, Any], output_dir: Path = REPORTS_DIR) -> tup
     if report["mode"] == "live":
         lines.extend(
             [
+                f"- **Models (Primary / Fallback / Embed):** {report.get('primary_model')} / {report.get('fallback_model')} / {report.get('embedding_model')}",
+                f"- **Database Dialect:** {report.get('database_dialect')}",
                 f"- **Self-Correction Rate:** {report['self_correction_rate'] * 100:.2f}% ({report['self_corrections']})",
                 f"- **Fallback Count:** {report['fallback_count']}",
                 f"- **Guard Rejections:** {report['guard_rejections']}",
@@ -436,6 +460,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional explicit database connection URL override.",
     )
+    parser.add_argument(
+        "--delay-seconds",
+        type=float,
+        default=0.0,
+        help="Optional delay between live cases to respect free-tier RPM limits.",
+    )
     args = parser.parse_args(argv)
 
     cases = json.loads(args.dataset.read_text(encoding="utf-8"))
@@ -445,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "offline":
             report = run_offline_eval(cases)
         else:
-            report = run_live_eval(cases)
+            report = run_live_eval(cases, delay_seconds=args.delay_seconds)
         json_path, md_path = write_reports(report)
         print(
             f"[{report['mode'].upper()}] {report['passed']}/{report['total_cases']} passed "

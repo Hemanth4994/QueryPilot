@@ -16,11 +16,10 @@ class HealthResponse(BaseModel):
     version: str = "4.0.0"
 
 
-class UserCredentialsRequest(BaseModel):
-    """Email and password payload for registration and login."""
+class _EmailAuthBase(BaseModel):
+    """Shared normalized email validation for authentication payloads."""
 
     email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=8, max_length=128)
 
     @field_validator("email")
     @classmethod
@@ -29,6 +28,18 @@ class UserCredentialsRequest(BaseModel):
         if "@" not in cleaned or "." not in cleaned.split("@", 1)[-1]:
             raise ValueError("Invalid email address.")
         return cleaned
+
+
+class UserCredentialsRequest(_EmailAuthBase):
+    """Email and password payload for new account registration."""
+
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class UserLoginRequest(_EmailAuthBase):
+    """Email and non-empty password payload for existing account login."""
+
+    password: str = Field(..., min_length=1, max_length=128)
 
 
 class UserResponse(BaseModel):

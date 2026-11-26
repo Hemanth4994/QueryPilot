@@ -149,12 +149,18 @@ def test_auth_register_login_me_and_401_enforcement(phase3_env):
     )
     assert dup.status_code == 409
 
-    # Wrong password returns 401
+    # Wrong password (including <8 chars) returns 401 instead of 422
     bad_login = client.post(
         "/api/v1/auth/login",
         json={"email": "alice@example.com", "password": "WrongPassword!"},
     )
     assert bad_login.status_code == 401
+
+    short_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "alice@example.com", "password": "123"},
+    )
+    assert short_login.status_code == 401
 
     # Valid login returns Bearer token and /auth/me resolves profile without password
     good_login = client.post(

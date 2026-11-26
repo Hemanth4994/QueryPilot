@@ -1,12 +1,37 @@
-# QueryPilot — AI-Powered Text-to-SQL Analytics Engine
+# QueryPilot — Multi-Tenant Text-to-SQL Analytics Engine
 
-QueryPilot is an enterprise-ready, multi-tenant Business Intelligence agent built with **FastAPI**, **PostgreSQL 16 + `pgvector`** (Schema RAG), **Redis** (caching & sliding-window rate limiting), an **ARQ** background worker queue, a thin **Streamlit** frontend, **Plotly** visualizations, **Google GenAI**, structured JSON telemetry, a 30-query golden evaluation harness, and GitHub Actions CI.
+QueryPilot is a multi-tenant Text-to-SQL analytics application built with **FastAPI**, **PostgreSQL 16 + `pgvector`** (Schema RAG), **Redis** (caching, rate limiting, and job state), an **ARQ** background worker queue, a thin **Streamlit** frontend, **Plotly** visualizations, and the **Google GenAI SDK**.
 
-## Architecture Overview
+## System Architecture
+
+```mermaid
+flowchart LR
+    User(["User Browser"]) --> UI["Streamlit Frontend\nfrontend/app.py"]
+    UI -->|"httpx + Bearer JWT"| API["FastAPI Backend\nbackend/app/main.py"]
+
+    API --> Auth["JWT Auth & bcrypt\ncore/auth.py"]
+    API --> Cache["Redis Cache & Rate Limiter\ncore/cache.py"]
+    API -->|"202 Accepted"| Queue["ARQ Worker\napp/worker.py"]
+    Queue --> Cache
+
+    API --> RAG["Schema RAG\ncore/schema_rag.py"]
+    Queue --> RAG
+    RAG -->|"Cosine Search\nowner_id IS NULL OR owner_id = user"| PG[("PostgreSQL 16 + pgvector\ncustomers, products, orders,\nu_{id}_*, schema_embeddings, users")]
+
+    RAG -->|"0 tables >= threshold\nINSUFFICIENT_SCHEMA"| API
+    RAG -->|"Top-K DDLs"| LLM["GenAI Client\ngemini-3.6-flash to 3.5-flash\n2-Stage SQL Self-Correction"]
+    LLM --> Guard["Read-Only & Tenant SQL Guard\nSELECT/WITH + u_{id}_* Check\nSET LOCAL READ ONLY + Timeout + Row Cap"]
+    Guard --> PG
+
+    API --> Telemetry["Structured JSON Telemetry\n/api/v1/metrics & Optional OTLP"]
+    Queue --> Telemetry
+```
+
+## Components
 
 | Layer | Component | Purpose |
 |---|---|---|
-| Frontend | `frontend/app.py` | Thin Streamlit client with JWT login/register, `httpx` API integration, `Cache Hit` badge, `Schema RAG & Query Details`, and async job polling. |
+| Frontend | `frontend/app.py` | Thin Streamlit client with JWT login/register, `httpx` API calls, `Cache Hit` badge, `Schema RAG & Query Details`, and async job polling. |
 | API | `backend/app/api/routes.py` | Versioned `/api/v1` REST API (`/health`, `/metrics`, `/auth/*`, `/schema`, `/schema/reindex`, `/query`, `/query/async`, `/upload`, `/jobs/{job_id}`). |
 | Auth & Isolation | `backend/app/core/auth.py`, `sql_guard.py` | Bcrypt password hashing (`pwdlib`), HS256 Bearer JWTs, `u_{user_id}_*` tenant table prefixing, and cross-tenant SQL guard + `SET LOCAL TRANSACTION READ ONLY` + `statement_timeout` + `MAX_QUERY_ROWS`. |
 | Schema RAG | `backend/app/core/schema_rag.py` | Indexes table DDLs into `schema_embeddings` (`pgvector`) with SHA-256 deduplication and retrieves top-k tenant-visible tables above `SCHEMA_RAG_MIN_SIMILARITY` (short-circuiting `INSUFFICIENT_SCHEMA` before SQL LLM calls). |
@@ -54,18 +79,57 @@ docker compose up --build
 - **Streamlit UI:** `http://localhost:8501`
 - **Backend Health:** `http://localhost:8000/api/v1/health`
 
-## Running Lint, Tests & Evaluations Locally
+## Local Development, Tests & Evaluations
+
+Activate your virtual environment first:
+
+- **macOS / Linux:**
+  ```bash
+  python3 -m venv .venv && source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  python -m venv .venv; .\.venv\Scripts\Activate.ps1
+  pip install -r requirements.txt
+  ```
+
+Then run lint, tests, and evaluations from the activated environment:
 
 ```bash
 # Lint with Ruff
-.\venv\Scripts\ruff.exe check .
+ruff check .
 
-# Full unit & integration test suite (offline, mocked GenAI + FakeRedis)
-.\venv\Scripts\pytest.exe -v
+# Unit & integration test suite (offline, mocked GenAI + FakeRedis)
+pytest -v
 
-# 30-query golden dataset evaluation (zero API cost)
-.\venv\Scripts\python.exe evals\run_eval.py --mode offline
-
-# Live end-to-end execution accuracy evaluation (writes report to evals/reports/)
-.\venv\Scripts\python.exe evals\run_eval.py --mode live
+# 30-query golden dataset validation (zero API cost; run in CI)
+python evals/run_eval.py --mode offline
 ```
+
+### Live Model Evaluation (`--mode live`)
+
+CI runs `--mode offline` only (validating the 30 golden SQL queries, SQL guard rejections, and `INSUFFICIENT_SCHEMA` threshold behavior without calling Gemini). To measure live end-to-end **Execution Accuracy**, self-correction rate, and latency against PostgreSQL + `pgvector` and your `GEMINI_API_KEY`:
+
+1. Start PostgreSQL (`pgvector/pgvector:pg16`):
+   ```bash
+   docker compose up -d db
+   ```
+2. Run the live harness (writes timestamped JSON and Markdown summaries to `evals/reports/`, which is gitignored):
+   - **macOS / Linux:**
+     ```bash
+     DATABASE_URL="postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot" \
+       python evals/run_eval.py --mode live
+     ```
+   - **Windows (PowerShell):**
+     ```powershell
+     $env:DATABASE_URL="postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot"
+     python evals/run_eval.py --mode live
+     ```
+
+### Evaluation Results
+
+| Mode | Scope & Stack | Verified Result | Latency & Notes |
+|---|---|---|---|
+| `--mode offline` | 30 golden cases (`8` single-table, `10` multi-table `JOIN`/`HAVING`, `5` CTE/window/time-series, `4` `INSUFFICIENT_SCHEMA`, `3` adversarial SQL blocks) | **30 / 30 passed (100%)** | Runs in CI with zero LLM calls; verifies SQL validity, guard rejections, and similarity threshold short-circuiting. |
+| `--mode live` *(2026-11-26)* | End-to-end Text-to-SQL on **PostgreSQL 16 + `pgvector`** (`gemini-embedding-001`, `gemini-3-flash-preview` with automatic fallback to `gemini-3.5-flash-lite` on free-tier quota) | **29 / 30 passed (96.67%)** | `single_table`: 8/8, `multi_table_join`: 9/10 (`mt_12` projected 1 col vs 2), `cte_window_timeseries`: 5/5, `insufficient_schema`: 4/4, `adversarial`: 3/3. **p50:** `2,404 ms`, **p95:** `5,480 ms` (with `--delay-seconds 4.5` free-tier pacing; `29` fallback routings, `28,048` input / `1,345` output tokens). |

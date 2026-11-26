@@ -18,7 +18,7 @@
   {
     "id": "st_03",
     "category": "single_table",
-    "question": "List all Hardware products sorted by unit price from highest to lowest.",
+    "question": "List the product name and unit price of all Hardware products sorted by unit price from highest to lowest.",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "SELECT product_name, unit_price FROM products WHERE category = 'Hardware' ORDER BY unit_price DESC, product_id ASC;"
@@ -50,7 +50,7 @@
   {
     "id": "st_07",
     "category": "single_table",
-    "question": "What are the top 5 most expensive products by unit price?",
+    "question": "What are the product name, category, and unit price of the top 5 most expensive products?",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "SELECT product_name, category, unit_price FROM products ORDER BY unit_price DESC, product_id ASC LIMIT 5;"
@@ -114,7 +114,7 @@
   {
     "id": "mt_15",
     "category": "multi_table_join",
-    "question": "Which customer regions generated more than 50000 in total revenue?",
+    "question": "Which customer regions generated more than 50000 in total revenue? Return region and total revenue.",
     "expected_status": "SUCCESS",
     "order_matters": false,
     "golden_sql": "SELECT c.region, SUM(o.revenue) AS total_revenue FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region HAVING SUM(o.revenue) > 50000;"
@@ -122,7 +122,7 @@
   {
     "id": "mt_16",
     "category": "multi_table_join",
-    "question": "List product categories whose average order revenue exceeds 1000.",
+    "question": "List product categories whose average order revenue exceeds 1000, returning category and average revenue.",
     "expected_status": "SUCCESS",
     "order_matters": false,
     "golden_sql": "SELECT p.category, AVG(o.revenue) AS avg_revenue FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category HAVING AVG(o.revenue) > 1000;"
@@ -138,7 +138,7 @@
   {
     "id": "mt_18",
     "category": "multi_table_join",
-    "question": "Which customers placed more than 5 orders?",
+    "question": "Which customers placed more than 5 orders? Return company name and order count.",
     "expected_status": "SUCCESS",
     "order_matters": false,
     "golden_sql": "SELECT c.company_name, COUNT(o.order_id) AS order_count FROM customers c JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.customer_id, c.company_name HAVING COUNT(o.order_id) > 5;"
@@ -146,7 +146,7 @@
   {
     "id": "cw_19",
     "category": "cte_window_timeseries",
-    "question": "Show monthly revenue totals across 2024 ordered chronologically.",
+    "question": "Show monthly revenue totals across 2024 ordered chronologically, with month formatted as YYYY-MM.",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "SELECT TO_CHAR(order_date, 'YYYY-MM') AS month, SUM(revenue) AS monthly_revenue FROM orders WHERE order_date >= '2024-01-01' AND order_date < '2025-01-01' GROUP BY TO_CHAR(order_date, 'YYYY-MM') ORDER BY month ASC;",
@@ -155,7 +155,7 @@
   {
     "id": "cw_20",
     "category": "cte_window_timeseries",
-    "question": "Using a CTE, find customers whose total spending exceeds the average total spending per customer.",
+    "question": "Using a CTE, find customers whose total spending exceeds the average total spending per customer. Return company name and total spending.",
     "expected_status": "SUCCESS",
     "order_matters": false,
     "golden_sql": "WITH customer_spend AS (SELECT c.customer_id, c.company_name, SUM(o.revenue) AS total_spend FROM customers c JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.customer_id, c.company_name) SELECT company_name, total_spend FROM customer_spend WHERE total_spend > (SELECT AVG(total_spend) FROM customer_spend);"
@@ -163,7 +163,7 @@
   {
     "id": "cw_21",
     "category": "cte_window_timeseries",
-    "question": "Rank products within each category by total revenue and return the top 2 per category.",
+    "question": "Rank products within each category by total revenue and return category, product name, total revenue, and rank for the top 2 per category.",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "WITH prod_rev AS (SELECT p.category, p.product_name, SUM(o.revenue) AS total_revenue, RANK() OVER (PARTITION BY p.category ORDER BY SUM(o.revenue) DESC) AS rev_rank FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category, p.product_id, p.product_name) SELECT category, product_name, total_revenue, rev_rank FROM prod_rev WHERE rev_rank <= 2 ORDER BY category ASC, rev_rank ASC;"
@@ -171,7 +171,7 @@
   {
     "id": "cw_22",
     "category": "cte_window_timeseries",
-    "question": "Calculate monthly revenue and running cumulative revenue over 2024.",
+    "question": "Calculate monthly revenue and running cumulative revenue over 2024, with month formatted as YYYY-MM.",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "WITH monthly AS (SELECT TO_CHAR(order_date, 'YYYY-MM') AS month, SUM(revenue) AS monthly_revenue FROM orders GROUP BY TO_CHAR(order_date, 'YYYY-MM')) SELECT month, monthly_revenue, SUM(monthly_revenue) OVER (ORDER BY month) AS cumulative_revenue FROM monthly ORDER BY month ASC;",
@@ -180,7 +180,7 @@
   {
     "id": "cw_23",
     "category": "cte_window_timeseries",
-    "question": "Show quarterly order counts for 2024.",
+    "question": "Show quarterly order counts for 2024 with quarter labeled as Q1, Q2, Q3, Q4 ordered chronologically.",
     "expected_status": "SUCCESS",
     "order_matters": true,
     "golden_sql": "WITH qtrs AS (SELECT CONCAT('Q', EXTRACT(QUARTER FROM order_date)::INT) AS quarter, order_id FROM orders WHERE order_date >= '2024-01-01' AND order_date < '2025-01-01') SELECT quarter, COUNT(order_id) AS order_count FROM qtrs GROUP BY quarter ORDER BY quarter ASC;",

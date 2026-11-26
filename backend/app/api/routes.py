@@ -1,11 +1,13 @@
 """Versioned v1 FastAPI routes with JWT auth, Redis cache, rate limit, ARQ, and metrics."""
 
 import base64
+import logging
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from starlette.concurrency import run_in_threadpool
 
@@ -51,28 +53,36 @@ from ..schemas import (
     TableSchema,
     UploadResponse,
     UserCredentialsRequest,
+    UserLoginRequest,
     UserResponse,
 )
-from ..worker import get_arq_pool
+from ..worker import close_arq_pool, get_arq_pool
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["querypilot-v1"])
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """Verify PostgreSQL and Redis readiness alongside shared schema table count."""
-    def _db_probe() -> list[dict]:
-        with get_engine().connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return get_structured_schema(user_id=None)
+    """Verify PostgreSQL and Redis readiness without crashing when degraded."""
+    def _db_probe() -> tuple[bool, int]:
+        try:
+            with get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            tables = get_structured_schema(user_id=None)
+            return len(tables) >= 3, len(tables)
+        except Exception as exc:
+            logger.warning("Database health probe failed (degraded): %s", exc)
+            return False, 0
 
-    tables = await run_in_threadpool(_db_probe)
+    database_ready, tables_count = await run_in_threadpool(_db_probe)
     redis_ready = await check_redis_health()
+    overall = "ok" if (database_ready and redis_ready) else "degraded"
     return HealthResponse(
-        status="ok",
-        database_ready=len(tables) >= 3,
+        status=overall,
+        database_ready=database_ready,
         redis_ready=redis_ready,
-        tables_count=len(tables),
+        tables_count=tables_count,
     )
 
 
@@ -96,7 +106,7 @@ async def register(payload: UserCredentialsRequest) -> AuthTokenResponse:
 
 
 @router.post("/auth/login", response_model=AuthTokenResponse)
-async def login(payload: UserCredentialsRequest) -> AuthTokenResponse:
+async def login(payload: UserLoginRequest) -> AuthTokenResponse:
     """Authenticate credentials and issue a Bearer JWT access token."""
     user = await run_in_threadpool(authenticate_user, payload.email, payload.password)
     token, expires_in = create_access_token(user.id, user.email)
@@ -192,6 +202,39 @@ async def query_data(
     return result
 
 
+async def _enqueue_worker_job(
+    user_id: int,
+    job_type: str,
+    func_name: str,
+    *job_args: object,
+) -> str:
+    """Persist initial job state and enqueue ARQ work, failing cleanly with 503 if Redis dies."""
+    pool = await get_arq_pool()
+    job_id = uuid.uuid4().hex
+    await save_job_state(
+        job_id=job_id,
+        user_id=user_id,
+        job_type=job_type,
+        job_status="queued",
+    )
+    try:
+        await pool.enqueue_job(func_name, job_id, user_id, *job_args)
+    except (RedisError, OSError) as exc:
+        await close_arq_pool()
+        try:
+            await save_job_state(
+                job_id=job_id,
+                user_id=user_id,
+                job_type=job_type,
+                job_status="failed",
+                error=f"Queue connection lost while submitting job: {exc}",
+            )
+        except RuntimeError:
+            pass
+        raise RuntimeError(f"Background job queue unavailable: {exc}") from exc
+    return job_id
+
+
 @router.post(
     "/query/async",
     response_model=JobSubmittedResponse,
@@ -203,15 +246,12 @@ async def query_data_async(
 ) -> JobSubmittedResponse:
     """Enqueue an analytical query on the ARQ Redis worker queue."""
     await enforce_rate_limit(current_user.id, scope="api")
-    pool = await get_arq_pool()
-    job_id = uuid.uuid4().hex
-    await save_job_state(
-        job_id=job_id,
-        user_id=current_user.id,
-        job_type="query",
-        job_status="queued",
+    job_id = await _enqueue_worker_job(
+        current_user.id,
+        "query",
+        "run_async_query_job",
+        payload.question,
     )
-    await pool.enqueue_job("run_async_query_job", job_id, current_user.id, payload.question)
     return JobSubmittedResponse(job_id=job_id, job_type="query", status="queued")
 
 
@@ -235,19 +275,11 @@ async def upload_csv(
         raise ValueError("Uploaded CSV file is empty.")
 
     if async_mode or len(content) > settings.async_upload_threshold_bytes:
-        pool = await get_arq_pool()
-        job_id = uuid.uuid4().hex
-        await save_job_state(
-            job_id=job_id,
-            user_id=current_user.id,
-            job_type="upload",
-            job_status="queued",
-        )
         content_b64 = base64.b64encode(content).decode("ascii")
-        await pool.enqueue_job(
-            "run_async_upload_job",
-            job_id,
+        job_id = await _enqueue_worker_job(
             current_user.id,
+            "upload",
+            "run_async_upload_job",
             filename,
             content_b64,
         )
@@ -267,6 +299,8 @@ async def get_job_status(
     """Return status and result for a background job owned by the authenticated user."""
     job = await get_job_state(job_id)
     if job is None:
+        if not await check_redis_health():
+            raise RuntimeError("Background job store is currently unavailable.")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
     if int(job["user_id"]) != current_user.id:
         raise HTTPException(

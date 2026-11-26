@@ -191,7 +191,12 @@ def build_chart_payload(df: pd.DataFrame) -> tuple[ChartSpec | None, dict[str, A
         return None, None
 
     title = f"{y_col} by {x_col}"
-    fig = px.bar(df, x=x_col, y=y_col, title=title, template="plotly_dark")
+    try:
+        fig = px.bar(df, x=x_col, y=y_col, title=title, template="plotly_dark")
+        plotly_payload = json.loads(fig.to_json())
+    except (ValueError, TypeError):
+        return None, None
+
     spec = ChartSpec(
         chart_type="bar",
         x_col=x_col,
@@ -199,7 +204,7 @@ def build_chart_payload(df: pd.DataFrame) -> tuple[ChartSpec | None, dict[str, A
         title=title,
         template="plotly_dark",
     )
-    return spec, json.loads(fig.to_json())
+    return spec, plotly_payload
 
 
 def _is_insufficient_schema(df: pd.DataFrame | None, sql_query: str) -> bool:
@@ -260,171 +265,130 @@ def _finalize_and_emit(
     return response
 
 
-def run_query_pipeline(
+def _run_query_pipeline_inner(
     question: str,
-    user_id: int | None = None,
-    request_id: str | None = None,
-    emit_telemetry: bool = True,
+    user_id: int | None,
+    req_id: str,
+    start: float,
+    emit_telemetry: bool,
+    state: dict[str, Any],
 ) -> QueryResponse:
-    """Execute tenant-scoped Schema RAG, 2-stage SQL repair, Plotly output, and telemetry."""
-    req_id = request_id or uuid.uuid4().hex
-    start = time.perf_counter()
+    """Core Schema RAG + SQL generation + 2-stage repair execution."""
+    retrieved = retrieve_relevant_tables(question, user_id=user_id)
+    retrieved_tables = [item.table_name for item in retrieved]
+    state["retrieved_tables"] = retrieved_tables
 
-    with trace_query_span("querypilot.run_query_pipeline", {"request_id": req_id, "user_id": user_id}):
-        retrieved = retrieve_relevant_tables(question, user_id=user_id)
-        retrieved_tables = [item.table_name for item in retrieved]
-
-        if not retrieved:
-            latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            resp = QueryResponse(
-                request_id=req_id,
-                question=question,
-                sql_query="",
-                status="INSUFFICIENT_SCHEMA",
-                rows=[],
-                columns=[],
-                row_count=0,
-                retrieved_tables=[],
-                message="The question cannot be answered using the available database schema.",
-                model=None,
-                latency_ms=latency_ms,
-                corrected=False,
-                self_correction_attempts=0,
-                fallback_triggered=False,
-                sql_guard_status="short_circuited",
-                input_tokens=0,
-                output_tokens=0,
-            )
-            return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
-
-        schema_context = "\n\n".join(item.ddl_text for item in retrieved)
-        allowed_tables = get_allowed_tables_for_user(user_id=user_id)
-        corrected = False
-        self_correction_attempts = 0
-        fallback_triggered = False
-
-        sql_query, model_used, in_tok, out_tok = get_sql_query_from_text_with_telemetry(
-            question,
-            schema_context=schema_context,
+    if not retrieved:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        resp = QueryResponse(
+            request_id=req_id,
+            question=question,
+            sql_query="",
+            status="INSUFFICIENT_SCHEMA",
+            rows=[],
+            columns=[],
+            row_count=0,
+            retrieved_tables=[],
+            message="The question cannot be answered using the available database schema.",
+            model=None,
+            latency_ms=latency_ms,
+            corrected=False,
+            self_correction_attempts=0,
+            fallback_triggered=False,
+            sql_guard_status="short_circuited",
+            input_tokens=0,
+            output_tokens=0,
         )
+        return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
+
+    schema_context = "\n\n".join(item.ddl_text for item in retrieved)
+    allowed_tables = get_allowed_tables_for_user(user_id=user_id)
+    corrected = False
+    self_correction_attempts = 0
+    fallback_triggered = False
+
+    sql_query, model_used, in_tok, out_tok = get_sql_query_from_text_with_telemetry(
+        question,
+        schema_context=schema_context,
+    )
+    state["model_used"] = model_used
+    state["input_tokens"] = in_tok
+    state["output_tokens"] = out_tok
+    if model_used == settings.fallback_model:
+        fallback_triggered = True
+        state["fallback_triggered"] = True
+
+    df, error, truncated = execute_sql_bounded(
+        sql_query,
+        user_id=user_id,
+        allowed_tables=allowed_tables,
+    )
+
+    if error:
+        corrected = True
+        self_correction_attempts = 1
+        state["self_correction_attempts"] = 1
+        correction_prompt = f"""
+        You wrote this PostgreSQL query: {sql_query}
+        It failed in the database with this exact error: {error}
+
+        Here is the Schema again:
+        {schema_context}
+
+        Fix the SQL query based on the error. RETURN ONLY THE RAW CORRECTED SQL.
+        """
+        raw_corrected, model_used, corr_in, corr_out = generate_with_retry_telemetry(
+            correction_prompt
+        )
+        in_tok += corr_in
+        out_tok += corr_out
+        state["model_used"] = model_used
+        state["input_tokens"] = in_tok
+        state["output_tokens"] = out_tok
         if model_used == settings.fallback_model:
             fallback_triggered = True
+            state["fallback_triggered"] = True
 
+        sql_query = strip_sql_fences(raw_corrected)
         df, error, truncated = execute_sql_bounded(
             sql_query,
             user_id=user_id,
             allowed_tables=allowed_tables,
         )
 
-        if error:
-            corrected = True
-            self_correction_attempts = 1
-            correction_prompt = f"""
-            You wrote this PostgreSQL query: {sql_query}
-            It failed in the database with this exact error: {error}
+    latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
-            Here is the Schema again:
-            {schema_context}
-
-            Fix the SQL query based on the error. RETURN ONLY THE RAW CORRECTED SQL.
-            """
-            raw_corrected, model_used, corr_in, corr_out = generate_with_retry_telemetry(
-                correction_prompt
-            )
-            in_tok += corr_in
-            out_tok += corr_out
-            if model_used == settings.fallback_model:
-                fallback_triggered = True
-
-            sql_query = strip_sql_fences(raw_corrected)
-            df, error, truncated = execute_sql_bounded(
-                sql_query,
-                user_id=user_id,
-                allowed_tables=allowed_tables,
-            )
-
-        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-
-        if error:
-            guard_status = "blocked" if error.startswith("Security Error") else "error"
-            resp = QueryResponse(
-                request_id=req_id,
-                question=question,
-                sql_query=sql_query,
-                status="ERROR",
-                retrieved_tables=retrieved_tables,
-                error=error,
-                model=model_used,
-                latency_ms=latency_ms,
-                corrected=corrected,
-                self_correction_attempts=self_correction_attempts,
-                fallback_triggered=fallback_triggered,
-                sql_guard_status=guard_status,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-            )
-            return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
-
-        if _is_insufficient_schema(df, sql_query):
-            resp = QueryResponse(
-                request_id=req_id,
-                question=question,
-                sql_query=sql_query,
-                status="INSUFFICIENT_SCHEMA",
-                rows=[],
-                columns=[str(col) for col in df.columns] if df is not None else [],
-                row_count=0,
-                retrieved_tables=retrieved_tables,
-                message="The question cannot be answered using the available database schema.",
-                model=model_used,
-                latency_ms=latency_ms,
-                corrected=corrected,
-                self_correction_attempts=self_correction_attempts,
-                fallback_triggered=fallback_triggered,
-                sql_guard_status="passed",
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-            )
-            return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
-
-        if df is None or df.empty:
-            resp = QueryResponse(
-                request_id=req_id,
-                question=question,
-                sql_query=sql_query,
-                status="NO_DATA",
-                rows=[],
-                columns=[str(col) for col in df.columns] if df is not None else [],
-                row_count=0,
-                retrieved_tables=retrieved_tables,
-                message="The query executed successfully but returned no data.",
-                model=model_used,
-                latency_ms=latency_ms,
-                corrected=corrected,
-                self_correction_attempts=self_correction_attempts,
-                fallback_triggered=fallback_triggered,
-                sql_guard_status="passed",
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-            )
-            return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
-
-        rows = serialize_dataframe(df)
-        columns = [str(col) for col in df.columns]
-        chart_spec, plotly_json = build_chart_payload(df)
-
+    if error:
+        guard_status = "blocked" if error.startswith("Security Error") else "error"
         resp = QueryResponse(
             request_id=req_id,
             question=question,
             sql_query=sql_query,
-            status="SUCCESS",
-            rows=rows,
-            columns=columns,
-            row_count=len(rows),
+            status="ERROR",
             retrieved_tables=retrieved_tables,
-            truncated=truncated,
-            chart_spec=chart_spec,
-            plotly_json=plotly_json,
+            error=error,
+            model=model_used,
+            latency_ms=latency_ms,
+            corrected=corrected,
+            self_correction_attempts=self_correction_attempts,
+            fallback_triggered=fallback_triggered,
+            sql_guard_status=guard_status,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+        )
+        return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
+
+    if _is_insufficient_schema(df, sql_query):
+        resp = QueryResponse(
+            request_id=req_id,
+            question=question,
+            sql_query=sql_query,
+            status="INSUFFICIENT_SCHEMA",
+            rows=[],
+            columns=[str(col) for col in df.columns] if df is not None else [],
+            row_count=0,
+            retrieved_tables=retrieved_tables,
+            message="The question cannot be answered using the available database schema.",
             model=model_used,
             latency_ms=latency_ms,
             corrected=corrected,
@@ -435,3 +399,100 @@ def run_query_pipeline(
             output_tokens=out_tok,
         )
         return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
+
+    if df is None or df.empty:
+        resp = QueryResponse(
+            request_id=req_id,
+            question=question,
+            sql_query=sql_query,
+            status="NO_DATA",
+            rows=[],
+            columns=[str(col) for col in df.columns] if df is not None else [],
+            row_count=0,
+            retrieved_tables=retrieved_tables,
+            message="The query executed successfully but returned no data.",
+            model=model_used,
+            latency_ms=latency_ms,
+            corrected=corrected,
+            self_correction_attempts=self_correction_attempts,
+            fallback_triggered=fallback_triggered,
+            sql_guard_status="passed",
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+        )
+        return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
+
+    rows = serialize_dataframe(df)
+    columns = [str(col) for col in df.columns]
+    chart_spec, plotly_json = build_chart_payload(df)
+
+    resp = QueryResponse(
+        request_id=req_id,
+        question=question,
+        sql_query=sql_query,
+        status="SUCCESS",
+        rows=rows,
+        columns=columns,
+        row_count=len(rows),
+        retrieved_tables=retrieved_tables,
+        truncated=truncated,
+        chart_spec=chart_spec,
+        plotly_json=plotly_json,
+        model=model_used,
+        latency_ms=latency_ms,
+        corrected=corrected,
+        self_correction_attempts=self_correction_attempts,
+        fallback_triggered=fallback_triggered,
+        sql_guard_status="passed",
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+    )
+    return _finalize_and_emit(resp, user_id) if emit_telemetry else resp
+
+
+def run_query_pipeline(
+    question: str,
+    user_id: int | None = None,
+    request_id: str | None = None,
+    emit_telemetry: bool = True,
+) -> QueryResponse:
+    """Execute tenant-scoped Schema RAG, 2-stage SQL repair, Plotly output, and telemetry."""
+    req_id = request_id or uuid.uuid4().hex
+    start = time.perf_counter()
+    state: dict[str, Any] = {
+        "retrieved_tables": [],
+        "model_used": None,
+        "fallback_triggered": False,
+        "self_correction_attempts": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+
+    with trace_query_span("querypilot.run_query_pipeline", {"request_id": req_id, "user_id": user_id}):
+        try:
+            return _run_query_pipeline_inner(
+                question=question,
+                user_id=user_id,
+                req_id=req_id,
+                start=start,
+                emit_telemetry=emit_telemetry,
+                state=state,
+            )
+        except Exception:
+            if emit_telemetry:
+                emit_query_telemetry(
+                    QueryTelemetryEvent(
+                        request_id=req_id,
+                        user_id=user_id,
+                        model_used=state["model_used"],
+                        fallback_triggered=state["fallback_triggered"],
+                        self_correction_attempts=state["self_correction_attempts"],
+                        cache_hit=False,
+                        retrieved_tables=state["retrieved_tables"],
+                        sql_guard_status="error",
+                        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                        input_tokens=state["input_tokens"],
+                        output_tokens=state["output_tokens"],
+                    )
+                )
+            raise

@@ -249,3 +249,31 @@ def test_tracing_disabled_by_default():
     assert settings.enable_tracing is False
     with telemetry.trace_query_span("test.span", {"request_id": "abc"}) as span:
         assert span is None
+
+
+def test_llm_client_routes_to_fallback_on_429_resource_exhausted():
+    from backend.app.core import llm_client
+
+    err_429 = errors.ClientError(429, {"error": {"message": "429 RESOURCE_EXHAUSTED"}})
+    mock_client = MagicMock()
+    calls: list[str] = []
+
+    def fake_generate(*, model: str, contents: str):
+        _ = contents
+        calls.append(model)
+        if len(calls) == 1:
+            raise err_429
+        return SimpleNamespace(
+            text="SELECT 1;",
+            usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=4),
+        )
+
+    mock_client.models.generate_content.side_effect = fake_generate
+    text_out, model_used, in_tok, out_tok = llm_client.generate_with_retry_telemetry(
+        "Return SELECT 1;",
+        client=mock_client,
+    )
+    assert text_out == "SELECT 1;"
+    assert model_used == settings.fallback_model
+    assert calls == [settings.primary_model, settings.fallback_model]
+    assert (in_tok, out_tok) == (10, 4)

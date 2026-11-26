@@ -245,7 +245,11 @@ async def save_job_state(
         "created_at": created_at or now_iso,
         "updated_at": now_iso,
     }
-    await client.set(job_metadata_key(job_id), json.dumps(payload), ex=86400)
+    try:
+        await client.set(job_metadata_key(job_id), json.dumps(payload), ex=86400)
+    except (RedisError, OSError) as exc:
+        logger.warning("Failed to persist job state %s: %s", job_id, exc)
+        raise RuntimeError(f"Background job store is unavailable: {exc}") from exc
     return payload
 
 
@@ -254,5 +258,15 @@ async def get_job_state(job_id: str) -> dict[str, Any] | None:
     client = get_redis_client()
     if client is None:
         raise RuntimeError("Redis is unavailable.")
-    raw = await client.get(job_metadata_key(job_id))
-    return json.loads(raw) if raw else None
+    try:
+        raw = await client.get(job_metadata_key(job_id))
+    except (RedisError, OSError) as exc:
+        logger.warning("Failed to fetch job state %s: %s", job_id, exc)
+        raise RuntimeError(f"Background job store is unavailable: {exc}") from exc
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("Corrupt job state JSON for %s: %s", job_id, exc)
+        return None
