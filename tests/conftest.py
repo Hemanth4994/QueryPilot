@@ -16,12 +16,14 @@ from backend.app.worker import set_arq_pool_for_tests
 def isolated_session_db(tmp_path_factory):
     """Point settings to temp DB + test-only JWT secret and prevent live API calls."""
     original_url = settings.database_url
+    original_read_url = settings.read_database_url
     original_key = settings.gemini_api_key
     original_jwt_secret = settings.jwt_secret_key
     original_env_key = os.environ.pop("GEMINI_API_KEY", None)
 
     db_file = tmp_path_factory.mktemp("querypilot_db") / "session_test.sqlite3"
     settings.database_url = f"sqlite:///{db_file.as_posix()}"
+    settings.read_database_url = ""
     settings.gemini_api_key = ""
     settings.jwt_secret_key = "test-only-ephemeral-jwt-signing-key-32-bytes"
     configure_database(settings.database_url)
@@ -34,6 +36,7 @@ def isolated_session_db(tmp_path_factory):
     set_arq_pool_for_tests(None)
     reset_genai_client()
     settings.database_url = original_url
+    settings.read_database_url = original_read_url
     settings.gemini_api_key = original_key
     settings.jwt_secret_key = original_jwt_secret
     if original_env_key is not None:

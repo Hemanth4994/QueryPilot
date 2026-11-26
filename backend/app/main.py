@@ -11,7 +11,11 @@ from .api.routes import router as v1_router
 from .config import settings
 from .core.auth import ensure_users_table
 from .core.cache import close_redis_client
-from .core.database import check_and_seed_db, configure_database
+from .core.database import (
+    check_and_seed_db,
+    configure_database,
+    sync_readonly_role_privileges,
+)
 from .core.schema_rag import ensure_schema_embeddings_table, index_all_tables
 from .schemas import ErrorResponse
 from .worker import close_arq_pool
@@ -26,6 +30,7 @@ async def lifespan(_app: FastAPI):
     check_and_seed_db()
     ensure_users_table()
     ensure_schema_embeddings_table()
+    sync_readonly_role_privileges()
     try:
         index_all_tables(force=False)
     except RuntimeError as exc:

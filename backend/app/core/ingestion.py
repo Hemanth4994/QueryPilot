@@ -9,7 +9,7 @@ import pandas as pd
 
 from ..schemas import TableSchema, UploadResponse
 from .agent import serialize_dataframe
-from .database import PROTECTED_TABLES, get_engine, get_structured_schema
+from .database import PROTECTED_TABLES, get_engine, get_structured_schema, grant_readonly_select
 from .schema_rag import upsert_table_embedding
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ def ingest_csv_bytes(
 
     table_name = resolve_table_name(filename, user_id=user_id)
     df.to_sql(name=table_name, con=get_engine(), if_exists="replace", index=False)
+    grant_readonly_select(table_name)
 
     try:
         embedding_indexed = upsert_table_embedding(table_name, owner_id=user_id, force=True)

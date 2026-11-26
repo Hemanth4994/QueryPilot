@@ -311,6 +311,8 @@ def run_live_eval(cases: list[dict[str, Any]], delay_seconds: float = 0.0) -> di
                 "latency_ms": resp.latency_ms,
                 "corrected": resp.corrected,
                 "model": resp.model,
+                "retrieved_tables": resp.retrieved_tables,
+                "sql_query": resp.sql_query,
             }
         )
 
@@ -407,7 +409,8 @@ def write_reports(report: dict[str, Any], output_dir: Path = REPORTS_DIR) -> tup
     if failures:
         lines.extend(["", "## Failures", ""])
         for item in failures:
-            lines.append(f"- **{item['id']}** ({item['category']}): {item['detail']}")
+            sql_note = f" | sql: `{item['sql_query']}`" if item.get("sql_query") else ""
+            lines.append(f"- **{item['id']}** ({item['category']}): {item['detail']}{sql_note}")
 
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, md_path

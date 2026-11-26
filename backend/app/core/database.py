@@ -1,23 +1,30 @@
 """PostgreSQL (and test SQLite) engine management, pooling, seeding, and tenant schema scope."""
 
 from datetime import datetime, timedelta
+import logging
 from pathlib import Path
 import random
 import re
 
 import pandas as pd
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import settings
+
+logger = logging.getLogger(__name__)
 
 CORE_TABLES = frozenset({"customers", "products", "orders"})
 INTERNAL_TABLES = frozenset({"schema_embeddings", "users"})
 PROTECTED_TABLES = CORE_TABLES | INTERNAL_TABLES
 USER_TABLE_PREFIX_RE = re.compile(r"^u_(\d+)_[a-z0-9_]+$")
+_PG_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 _engine: Engine | None = None
 _read_engine: Engine | None = None
 _configured_url: str | None = None
+_configured_read_url: str | None = None
 
 
 def _ensure_sqlite_parent_dir(database_url: str) -> None:
@@ -30,8 +37,11 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
     Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
 
 
-def _create_pair(database_url: str) -> tuple[Engine, Engine]:
-    """Create pooled PostgreSQL engine or SQLite write/read-only engine pair."""
+def _create_pair(
+    database_url: str,
+    read_database_url: str | None = None,
+) -> tuple[Engine, Engine]:
+    """Create pooled PostgreSQL engine pair (with optional read-only role) or SQLite pair."""
     if database_url.startswith("sqlite"):
         _ensure_sqlite_parent_dir(database_url)
         connect_args = {"check_same_thread": False}
@@ -50,19 +60,37 @@ def _create_pair(database_url: str) -> tuple[Engine, Engine]:
         max_overflow=settings.db_max_overflow,
         pool_pre_ping=True,
     )
+    read_url = (read_database_url or "").strip()
+    if read_url and read_url != database_url:
+        read_pg_eng = create_engine(
+            read_url,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_pre_ping=True,
+        )
+        return pg_eng, read_pg_eng
     return pg_eng, pg_eng
 
 
-def configure_database(database_url: str | None = None) -> tuple[Engine, Engine]:
+def configure_database(
+    database_url: str | None = None,
+    read_database_url: str | None = None,
+) -> tuple[Engine, Engine]:
     """Reconfigure active database engines (used at startup and in isolated tests)."""
-    global _engine, _read_engine, _configured_url
+    global _engine, _read_engine, _configured_url, _configured_read_url
     target_url = database_url or settings.database_url
+    target_read_url = (
+        read_database_url
+        if read_database_url is not None
+        else ("" if target_url.startswith("sqlite") else settings.read_database_url)
+    )
     if _engine is not None:
         _engine.dispose()
     if _read_engine is not None and _read_engine is not _engine:
         _read_engine.dispose()
-    _engine, _read_engine = _create_pair(target_url)
+    _engine, _read_engine = _create_pair(target_url, read_database_url=target_read_url)
     _configured_url = target_url
+    _configured_read_url = target_read_url
     return _engine, _read_engine
 
 
@@ -86,6 +114,83 @@ def is_postgres(target_engine: Engine | None = None) -> bool:
     """Return True when the active engine dialect is PostgreSQL."""
     eng = target_engine or get_engine()
     return eng.dialect.name == "postgresql"
+
+
+def get_readonly_role(
+    read_database_url: str | None = None,
+    write_database_url: str | None = None,
+) -> str | None:
+    """Extract the dedicated read-only PostgreSQL role name when READ_DATABASE_URL is set."""
+    read_url = (
+        read_database_url
+        if read_database_url is not None
+        else (_configured_read_url or settings.read_database_url)
+    ).strip()
+    write_url = (write_database_url or _configured_url or settings.database_url).strip()
+    if not read_url or read_url.startswith("sqlite") or write_url.startswith("sqlite"):
+        return None
+    try:
+        read_user = (make_url(read_url).username or "").strip()
+        write_user = (make_url(write_url).username or "").strip()
+    except Exception:
+        return None
+    if not read_user or read_user == write_user or not _PG_IDENT_RE.match(read_user):
+        return None
+    return read_user
+
+
+def grant_readonly_select(table_name: str, target_engine: Engine | None = None) -> bool:
+    """Grant SELECT on a single business/tenant table to the configured read-only DB role."""
+    eng = target_engine or get_engine()
+    if not is_postgres(eng) or table_name in INTERNAL_TABLES or not _PG_IDENT_RE.match(table_name):
+        return False
+    role = get_readonly_role()
+    if not role:
+        return False
+    try:
+        with eng.begin() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                {"role": role},
+            ).scalar()
+            if not exists:
+                return False
+            conn.execute(text(f'GRANT USAGE ON SCHEMA public TO "{role}";'))
+            conn.execute(text(f'GRANT SELECT ON TABLE "{table_name}" TO "{role}";'))
+        return True
+    except SQLAlchemyError as exc:
+        logger.warning("Unable to grant SELECT on '%s' to role '%s': %s", table_name, role, exc)
+        return False
+
+
+def sync_readonly_role_privileges(target_engine: Engine | None = None) -> None:
+    """Enforce least-privilege SELECT grants on public/tenant tables and revoke internal tables."""
+    eng = target_engine or get_engine()
+    if not is_postgres(eng):
+        return
+    role = get_readonly_role()
+    if not role:
+        return
+    inspector = inspect(eng)
+    existing = set(inspector.get_table_names())
+    try:
+        with eng.begin() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                {"role": role},
+            ).scalar()
+            if not exists:
+                return
+            conn.execute(text(f'GRANT USAGE ON SCHEMA public TO "{role}";'))
+            for tbl in sorted(existing):
+                if not _PG_IDENT_RE.match(tbl):
+                    continue
+                if tbl in INTERNAL_TABLES:
+                    conn.execute(text(f'REVOKE ALL ON TABLE "{tbl}" FROM "{role}";'))
+                elif tbl in CORE_TABLES or USER_TABLE_PREFIX_RE.match(tbl):
+                    conn.execute(text(f'GRANT SELECT ON TABLE "{tbl}" TO "{role}";'))
+    except SQLAlchemyError as exc:
+        logger.warning("Unable to sync read-only role '%s' privileges: %s", role, exc)
 
 
 def ensure_vector_extension(target_engine: Engine | None = None) -> None:
@@ -156,6 +261,7 @@ def init_db(target_engine: Engine | None = None, if_exists: str = "replace") -> 
         customers.to_sql("customers", conn, if_exists=if_exists, index=False)
         products.to_sql("products", conn, if_exists=if_exists, index=False)
         orders.to_sql("orders", conn, if_exists=if_exists, index=False)
+    sync_readonly_role_privileges(eng)
 
 
 def check_and_seed_db(target_engine: Engine | None = None) -> None:

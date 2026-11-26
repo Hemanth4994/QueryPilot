@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot",
         validation_alias=AliasChoices("DATABASE_URL", "DB_URL", "database_url"),
     )
+    read_database_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("READ_DATABASE_URL", "read_database_url"),
+    )
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         validation_alias=AliasChoices("REDIS_URL", "redis_url"),

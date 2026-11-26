@@ -51,7 +51,8 @@ Copy `.env.example` to `.env` before running:
 | `JWT_ALGORITHM` | `HS256` | JWT signing algorithm |
 | `JWT_EXPIRE_MINUTES` | `60` | Access token lifetime in minutes |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `querypilot` | PostgreSQL container credentials |
-| `DATABASE_URL` | `postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot` | SQLAlchemy PostgreSQL connection URL |
+| `DATABASE_URL` | `postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot` | SQLAlchemy PostgreSQL write/auth connection URL |
+| `READ_DATABASE_URL` | `""` *(falls back to `DATABASE_URL`)* | Optional least-privilege read-only PostgreSQL URL for executing generated SQL |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis URL for caching, rate limiting, and ARQ |
 | `CACHE_TTL_SECONDS` | `300` | Schema and query cache TTL |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Max query/upload requests per user per minute |
@@ -78,6 +79,16 @@ docker compose up --build
 
 - **Streamlit UI:** `http://localhost:8501`
 - **Backend Health:** `http://localhost:8000/api/v1/health`
+
+### Production Hardening: Dedicated Read-Only DB Role
+
+When hosting QueryPilot publicly, pair transaction-level `SET LOCAL TRANSACTION READ ONLY` with a dedicated PostgreSQL role (`READ_DATABASE_URL`) that only holds `SELECT` on shared demo and uploaded tenant tables (`u_*`) and zero privileges on `users` or `schema_embeddings`:
+
+1. Provision the role using [infra/init-readonly-role.sql](infra/init-readonly-role.sql) (update the placeholder password first):
+   ```bash
+   psql -U querypilot -d querypilot -f infra/init-readonly-role.sql
+   ```
+2. Set `READ_DATABASE_URL=postgresql+psycopg://querypilot_reader:<password>@db:5432/querypilot` in `.env`. QueryPilot will execute generated SQL exclusively via `READ_DATABASE_URL` and automatically run `GRANT SELECT` for newly uploaded tenant tables while keeping `users` and `schema_embeddings` revoked.
 
 ## Local Development, Tests & Evaluations
 
@@ -132,4 +143,5 @@ CI runs `--mode offline` only (validating the 30 golden SQL queries, SQL guard r
 | Mode | Scope & Stack | Verified Result | Latency & Notes |
 |---|---|---|---|
 | `--mode offline` | 30 golden cases (`8` single-table, `10` multi-table `JOIN`/`HAVING`, `5` CTE/window/time-series, `4` `INSUFFICIENT_SCHEMA`, `3` adversarial SQL blocks) | **30 / 30 passed (100%)** | Runs in CI with zero LLM calls; verifies SQL validity, guard rejections, and similarity threshold short-circuiting. |
-| `--mode live` *(2026-11-26)* | End-to-end Text-to-SQL on **PostgreSQL 16 + `pgvector`** (`gemini-embedding-001`, `gemini-3-flash-preview` with automatic fallback to `gemini-3.5-flash-lite` on free-tier quota) | **29 / 30 passed (96.67%)** | `single_table`: 8/8, `multi_table_join`: 9/10 (`mt_12` projected 1 col vs 2), `cte_window_timeseries`: 5/5, `insufficient_schema`: 4/4, `adversarial`: 3/3. **p50:** `2,404 ms`, **p95:** `5,480 ms` (with `--delay-seconds 4.5` free-tier pacing; `29` fallback routings, `28,048` input / `1,345` output tokens). |
+| `--mode live` (`gemini-3.5-flash-lite` fallback) | End-to-end Text-to-SQL on **PostgreSQL 16 + `pgvector`** (`gemini-embedding-001`, `gemini-3-flash-preview` falling back to `gemini-3.5-flash-lite` on free-tier quota) | **29 / 30 passed (96.67%)** | `single_table`: 8/8, `multi_table_join`: 9/10 (`mt_12` projected 1 col vs 2), `cte_window_timeseries`: 5/5, `insufficient_schema`: 4/4, `adversarial`: 3/3. **p50:** `2,404 ms`, **p95:** `5,480 ms` (`29` fallback routings). |
+| `--mode live` (`gemini-3.1-flash-lite` direct) | End-to-end Text-to-SQL on **PostgreSQL 16 + `pgvector`** (`gemini-3.1-flash-lite` primary with active quota, `0` fallbacks) | **28 / 30 passed (93.33%)** | `single_table`: 8/8, `multi_table_join`: 9/10 (`mt_12` projected `company_name` only instead of 2 columns), `cte_window_timeseries`: 5/5, `insufficient_schema`: 4/4, `adversarial`: 2/3 (`adv_29` sanitized stacked `DELETE` down to safe `SELECT * FROM customers;`). **p50:** `2,069 ms`, **p95:** `29,717 ms` (`0` fallbacks, `28,048` input / `1,250` output tokens). |

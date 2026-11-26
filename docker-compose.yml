@@ -48,6 +48,7 @@ services:
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-querypilot}:${POSTGRES_PASSWORD:-querypilot}@db:5432/${POSTGRES_DB:-querypilot}
+      READ_DATABASE_URL: ${READ_DATABASE_URL:-}
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
@@ -98,6 +99,7 @@ services:
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-querypilot}:${POSTGRES_PASSWORD:-querypilot}@db:5432/${POSTGRES_DB:-querypilot}
+      READ_DATABASE_URL: ${READ_DATABASE_URL:-}
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}

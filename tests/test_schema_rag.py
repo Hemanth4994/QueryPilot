@@ -209,3 +209,46 @@ def test_postgres_pooling_vector_extension_and_cosine_query(monkeypatch):
     rag_sql = str(query_conn.execute.call_args[0][0])
     assert "<=>" in rag_sql
     assert "owner_id IS NULL OR owner_id = :user_id" in rag_sql
+
+
+def test_dedicated_readonly_database_url_creates_separate_read_engine_and_grants(monkeypatch):
+    created_urls: list[str] = []
+
+    def fake_create_engine(url, **kwargs):
+        _ = kwargs
+        created_urls.append(url)
+        fake_eng = MagicMock()
+        fake_eng.dialect.name = "postgresql"
+        return fake_eng
+
+    monkeypatch.setattr(database, "create_engine", fake_create_engine)
+    write_url = "postgresql+psycopg://querypilot:pass@db:5432/querypilot"
+    read_url = "postgresql+psycopg://querypilot_reader:rpass@db:5432/querypilot"
+
+    write_eng, read_eng = database._create_pair(write_url, read_database_url=read_url)
+    assert write_eng is not read_eng
+    assert created_urls == [write_url, read_url]
+
+    role = database.get_readonly_role(read_database_url=read_url, write_database_url=write_url)
+    assert role == "querypilot_reader"
+
+    prev_read_url = settings.read_database_url
+    prev_db_url = settings.database_url
+    try:
+        settings.database_url = write_url
+        settings.read_database_url = read_url
+        monkeypatch.setattr(database, "_configured_url", write_url)
+        monkeypatch.setattr(database, "_configured_read_url", read_url)
+
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.scalar.return_value = 1
+        write_eng.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        write_eng.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert database.grant_readonly_select("u_1_targets", target_engine=write_eng) is True
+        grant_sqls = [str(call.args[0]) for call in mock_conn.execute.call_args_list]
+        assert any('GRANT SELECT ON TABLE "u_1_targets" TO "querypilot_reader"' in s for s in grant_sqls)
+        assert database.grant_readonly_select("users", target_engine=write_eng) is False
+    finally:
+        settings.read_database_url = prev_read_url
+        settings.database_url = prev_db_url
