@@ -56,6 +56,9 @@ services:
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
       ASYNC_UPLOAD_THRESHOLD_BYTES: ${ASYNC_UPLOAD_THRESHOLD_BYTES:-524288}
+      MAX_UPLOAD_SIZE_BYTES: ${MAX_UPLOAD_SIZE_BYTES:-2147483648}
+      UPLOAD_DIR: /app/uploads
+      WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-1800}
       ENABLE_TRACING: ${ENABLE_TRACING:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-querypilot-backend}
@@ -68,6 +71,8 @@ services:
       SCHEMA_RAG_MIN_SIMILARITY: ${SCHEMA_RAG_MIN_SIMILARITY:-0.35}
       QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-10000}
       MAX_QUERY_ROWS: ${MAX_QUERY_ROWS:-1000}
+    volumes:
+      - upload_data:/app/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -105,6 +110,9 @@ services:
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      MAX_UPLOAD_SIZE_BYTES: ${MAX_UPLOAD_SIZE_BYTES:-2147483648}
+      UPLOAD_DIR: /app/uploads
+      WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-1800}
       ENABLE_TRACING: ${ENABLE_TRACING:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-querypilot-worker}
@@ -115,6 +123,8 @@ services:
       SCHEMA_RAG_MIN_SIMILARITY: ${SCHEMA_RAG_MIN_SIMILARITY:-0.35}
       QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-10000}
       MAX_QUERY_ROWS: ${MAX_QUERY_ROWS:-1000}
+    volumes:
+      - upload_data:/app/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -131,6 +141,7 @@ services:
       - "8501:8501"
     environment:
       BACKEND_URL: http://backend:8000
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
     depends_on:
       backend:
         condition: service_healthy
@@ -150,3 +161,4 @@ services:
 
 volumes:
   pg_data:
+  upload_data:

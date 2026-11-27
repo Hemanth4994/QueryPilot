@@ -140,7 +140,7 @@ class QueryResponse(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    """Response returned after synchronously ingesting a custom CSV table."""
+    """Response returned after ingesting a custom CSV table."""
 
     table_name: str
     row_count: int
@@ -148,6 +148,8 @@ class UploadResponse(BaseModel):
     preview: list[dict[str, Any]]
     tables: list[TableSchema]
     embedding_indexed: bool = True
+    indexed_columns: list[str] = Field(default_factory=list)
+    ingestion_mode: str = "standard"
 
 
 class JobSubmittedResponse(BaseModel):

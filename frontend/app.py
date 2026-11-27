@@ -1,6 +1,5 @@
 """Thin Streamlit frontend client for QueryPilot with JWT auth and async job polling."""
 
-import hashlib
 import json
 import os
 import time
@@ -11,6 +10,7 @@ import plotly.io as pio
 import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "2048"))
 
 st.set_page_config(page_title="AI-BI Analytics Agent", page_icon="📊", layout="wide")
 st.title("🤖 AI-Powered Business Intelligence")
@@ -307,23 +307,28 @@ if st.sidebar.button("Sign Out", width="stretch"):
 st.sidebar.markdown("---")
 st.sidebar.header("📁 Upload Custom Data")
 async_upload = st.sidebar.checkbox("Queue upload via background worker", value=False)
-uploaded_file = st.sidebar.file_uploader("Upload a CSV to query", type=["csv"])
+uploaded_file = st.sidebar.file_uploader(
+    f"Upload a CSV to query (up to {MAX_UPLOAD_MB} MB)",
+    type=["csv"],
+)
 
 if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
+    file_size = getattr(uploaded_file, "size", 0) or 0
+    file_id = getattr(uploaded_file, "file_id", "")
     file_signature = (
-        f"{st.session_state.get('user_email')}:{uploaded_file.name}:"
-        f"{hashlib.sha256(file_bytes).hexdigest()}:{async_upload}"
+        f"{st.session_state.get('user_email')}:{uploaded_file.name}:{file_size}:{file_id}:{async_upload}"
     )
     if st.session_state.get("last_upload_signature") != file_signature:
+        size_mb = file_size / (1024 * 1024)
         try:
-            with st.sidebar.status("Uploading & indexing CSV...", expanded=False):
+            with st.sidebar.status(f"Streaming & indexing CSV ({size_mb:.1f} MB)...", expanded=False):
+                uploaded_file.seek(0)
                 resp = httpx.post(
                     f"{BACKEND_URL}/api/v1/upload",
                     params={"async_mode": str(async_upload).lower()},
                     headers=_auth_headers(),
-                    files={"file": (uploaded_file.name, file_bytes, "text/csv")},
-                    timeout=60.0,
+                    files={"file": (uploaded_file.name, uploaded_file, "text/csv")},
+                    timeout=httpx.Timeout(600.0, connect=15.0),
                 )
                 if _handle_auth_status(resp):
                     st.stop()
@@ -334,7 +339,10 @@ if uploaded_file is not None:
                     st.sidebar.error(f"Upload failed: {detail}")
                 elif resp.status_code == 202:
                     job_info = _parse_json_or_raise(resp, "Async upload")
-                    upload_payload = poll_job_until_complete(job_info["job_id"])
+                    upload_payload = poll_job_until_complete(
+                        job_info["job_id"],
+                        timeout_seconds=1800.0,
+                    )
                     if upload_payload is not None:
                         st.session_state["last_upload_signature"] = file_signature
                         st.session_state["last_upload_result"] = upload_payload
@@ -346,12 +354,17 @@ if uploaded_file is not None:
 
     upload_result = st.session_state.get("last_upload_result")
     if upload_result and st.session_state.get("last_upload_signature") == file_signature:
+        row_total = int(upload_result.get("row_count", 0))
+        idx_cols = upload_result.get("indexed_columns") or []
+        idx_note = f" · indexed: {', '.join(idx_cols)}" if idx_cols else ""
         if upload_result.get("embedding_indexed", True):
-            st.sidebar.success(f"✅ Uploaded & indexed table: '{upload_result['table_name']}'")
+            st.sidebar.success(
+                f"✅ Uploaded '{upload_result['table_name']}' ({row_total:,} rows{idx_note})"
+            )
         else:
             st.sidebar.warning(
-                f"⚠️ Saved table '{upload_result['table_name']}', but Schema RAG indexing failed. "
-                "Click Reindex Schema RAG once Gemini API is available."
+                f"⚠️ Saved table '{upload_result['table_name']}' ({row_total:,} rows{idx_note}), "
+                "but Schema RAG indexing failed. Click Reindex Schema RAG once Gemini API is available."
             )
         with st.sidebar.expander("Preview Data"):
             preview_df = pd.DataFrame(upload_result["preview"], columns=upload_result["columns"])

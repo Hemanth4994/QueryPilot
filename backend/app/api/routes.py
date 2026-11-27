@@ -1,7 +1,7 @@
 """Versioned v1 FastAPI routes with JWT auth, Redis cache, rate limit, ARQ, and metrics."""
 
-import base64
 import logging
+from pathlib import Path
 import time
 import uuid
 
@@ -33,7 +33,7 @@ from ..core.cache import (
     set_cached_schema,
 )
 from ..core.database import get_engine, get_schema_for_llm, get_structured_schema
-from ..core.ingestion import ingest_csv_bytes
+from ..core.ingestion import ingest_csv_file
 from ..core.schema_rag import index_all_tables
 from ..core.telemetry import (
     QueryTelemetryEvent,
@@ -255,6 +255,37 @@ async def query_data_async(
     return JobSubmittedResponse(job_id=job_id, job_type="query", status="queued")
 
 
+_UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+async def _stream_upload_to_disk(file: UploadFile) -> tuple[Path, int]:
+    """Stream multipart CSV upload directly to shared disk while enforcing MAX_UPLOAD_SIZE_BYTES."""
+    upload_root = Path(settings.upload_dir)
+    upload_root.mkdir(parents=True, exist_ok=True)
+    staged_path = upload_root / f"{uuid.uuid4().hex}.csv"
+    total_bytes = 0
+    max_bytes = int(settings.max_upload_size_bytes)
+
+    try:
+        with staged_path.open("wb") as out:
+            while chunk := await file.read(_UPLOAD_STREAM_CHUNK_BYTES):
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        detail=f"Uploaded CSV exceeds maximum limit ({max_bytes // (1024 * 1024)} MB).",
+                    )
+                out.write(chunk)
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
+
+    if total_bytes == 0:
+        staged_path.unlink(missing_ok=True)
+        raise ValueError("Uploaded CSV file is empty.")
+    return staged_path, total_bytes
+
+
 @router.post(
     "/upload",
     response_model=UploadResponse | JobSubmittedResponse,
@@ -264,29 +295,34 @@ async def upload_csv(
     async_mode: bool = Query(default=False, description="Enqueue CSV ingestion in worker."),
     current_user: User = Depends(get_current_user),
 ):
-    """Upload a tenant-scoped CSV synchronously or enqueue large files to the worker."""
+    """Stream tenant-scoped CSV (up to 2 GB) to disk and ingest via Postgres COPY or worker."""
     await enforce_rate_limit(current_user.id, scope="api")
 
     filename = file.filename or "uploaded.csv"
     if not filename.lower().endswith(".csv"):
         raise ValueError("Only .csv files are supported.")
-    content = await file.read()
-    if not content:
-        raise ValueError("Uploaded CSV file is empty.")
+    staged_path, total_bytes = await _stream_upload_to_disk(file)
 
-    if async_mode or len(content) > settings.async_upload_threshold_bytes:
-        content_b64 = base64.b64encode(content).decode("ascii")
-        job_id = await _enqueue_worker_job(
-            current_user.id,
-            "upload",
-            "run_async_upload_job",
-            filename,
-            content_b64,
-        )
+    if async_mode or total_bytes > settings.async_upload_threshold_bytes:
+        try:
+            job_id = await _enqueue_worker_job(
+                current_user.id,
+                "upload",
+                "run_async_upload_job",
+                filename,
+                str(staged_path),
+                True,
+            )
+        except Exception:
+            staged_path.unlink(missing_ok=True)
+            raise
         accepted = JobSubmittedResponse(job_id=job_id, job_type="upload", status="queued")
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=accepted.model_dump())
 
-    result = await run_in_threadpool(ingest_csv_bytes, content, filename, current_user.id)
+    try:
+        result = await run_in_threadpool(ingest_csv_file, staged_path, filename, current_user.id)
+    finally:
+        staged_path.unlink(missing_ok=True)
     await invalidate_user_cache(current_user.id)
     return result
 

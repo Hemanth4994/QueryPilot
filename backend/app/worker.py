@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import logging
+from pathlib import Path
 import time
 from typing import Any
 
@@ -24,7 +25,7 @@ from .core.cache import (
     set_cached_query,
 )
 from .core.database import check_and_seed_db, configure_database, get_schema_for_llm
-from .core.ingestion import ingest_csv_bytes
+from .core.ingestion import ingest_csv_bytes, ingest_csv_file
 from .core.schema_rag import ensure_schema_embeddings_table
 from .core.telemetry import QueryTelemetryEvent, emit_query_telemetry, trace_query_span
 
@@ -165,9 +166,10 @@ async def run_async_upload_job(
     job_id: str,
     user_id: int,
     filename: str,
-    content_b64: str,
+    payload_or_path: str,
+    is_file_path: bool = False,
 ) -> dict[str, Any]:
-    """Ingest a large CSV upload and upsert its pgvector embedding in the ARQ worker."""
+    """Ingest a large CSV upload from staged disk path (or legacy base64) in ARQ."""
     existing = await get_job_state(job_id)
     created_at = existing["created_at"] if existing else None
     await save_job_state(
@@ -178,9 +180,13 @@ async def run_async_upload_job(
         created_at=created_at,
     )
 
+    staged_path = Path(payload_or_path) if is_file_path else None
     try:
-        raw_bytes = base64.b64decode(content_b64.encode("ascii"))
-        upload_resp = await run_in_threadpool(ingest_csv_bytes, raw_bytes, filename, user_id)
+        if staged_path is not None:
+            upload_resp = await run_in_threadpool(ingest_csv_file, staged_path, filename, user_id)
+        else:
+            raw_bytes = base64.b64decode(payload_or_path.encode("ascii"))
+            upload_resp = await run_in_threadpool(ingest_csv_bytes, raw_bytes, filename, user_id)
         await invalidate_user_cache(user_id)
         return await save_job_state(
             job_id=job_id,
@@ -200,6 +206,9 @@ async def run_async_upload_job(
             error=str(exc),
             created_at=created_at,
         )
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
 
 
 async def startup(_ctx: dict[str, Any]) -> None:
@@ -223,4 +232,4 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 10
-    job_timeout = 300
+    job_timeout = settings.worker_job_timeout_seconds

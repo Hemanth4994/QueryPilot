@@ -36,7 +36,7 @@ flowchart LR
 | Auth & Isolation | `backend/app/core/auth.py`, `sql_guard.py` | Bcrypt password hashing (`pwdlib`), HS256 Bearer JWTs, `u_{user_id}_*` tenant table prefixing, and cross-tenant SQL guard + `SET LOCAL TRANSACTION READ ONLY` + `statement_timeout` + `MAX_QUERY_ROWS`. |
 | Schema RAG | `backend/app/core/schema_rag.py` | Indexes table DDLs into `schema_embeddings` (`pgvector`) with SHA-256 deduplication and retrieves top-k tenant-visible tables above `SCHEMA_RAG_MIN_SIMILARITY` (short-circuiting `INSUFFICIENT_SCHEMA` before SQL LLM calls). |
 | LLM & Repair | `backend/app/core/llm_client.py`, `agent.py` | `.env`-driven `PRIMARY_MODEL` / `FALLBACK_MODEL` routing with 3-attempt exponential backoff on HTTP `503` and 2-stage SQL self-correction. |
-| Cache & Queue | `backend/app/core/cache.py`, `worker.py` | Redis schema/query caching with invalidation on upload/reindex, 60s sliding-window rate limiter (`429`), graceful Redis fallback, and ARQ background workers. |
+| Cache & Queue | `backend/app/core/cache.py`, `worker.py`, `ingestion.py` | Redis schema/query caching with invalidation on upload/reindex, 60s sliding-window rate limiter (`429`), disk-streamed uploads up to `2 GB`, PostgreSQL `COPY FROM STDIN` + auto-indexing + `ANALYZE`, and ARQ background workers. |
 | Observability | `backend/app/core/telemetry.py` | Single-line JSON query telemetry logs, authenticated `GET /api/v1/metrics` counters, and optional OpenTelemetry OTLP export (`ENABLE_TRACING=true`). |
 | Evaluation & CI | `evals/`, `.github/workflows/ci.yml` | 30-query golden dataset (`--mode offline` and `--mode live` normalized result-set comparison) and automated lint/test/eval/Docker CI. |
 
@@ -57,6 +57,10 @@ Copy `.env.example` to `.env` before running:
 | `CACHE_TTL_SECONDS` | `300` | Schema and query cache TTL |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Max query/upload requests per user per minute |
 | `ASYNC_UPLOAD_THRESHOLD_BYTES` | `524288` | File size threshold triggering async worker upload |
+| `MAX_UPLOAD_SIZE_BYTES` | `2147483648` | Max streamed CSV upload size (`2 GB` default) |
+| `UPLOAD_DIR` | `/app/uploads` *(Docker)* | Shared staging directory for disk-streamed API/worker uploads |
+| `WORKER_JOB_TIMEOUT_SECONDS` | `1800` | ARQ worker job timeout (`30 min` for multi-GB `COPY` loads) |
+| `MAX_UPLOAD_MB` | `2048` | Streamlit upload limit (`2 GB`) |
 | `PRIMARY_MODEL` | `gemini-3.6-flash` | Primary SQL generation model |
 | `FALLBACK_MODEL` | `gemini-3.5-flash` | Fallback model after 503 retries |
 | `EMBEDDING_MODEL` | `gemini-embedding-001` | Embedding model for Schema RAG |

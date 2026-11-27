@@ -1,6 +1,7 @@
 """Application configuration loaded via Pydantic Settings."""
 
 from pathlib import Path
+import tempfile
 from typing import Annotated
 
 from pydantic import AliasChoices, BeforeValidator, Field
@@ -72,6 +73,26 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "ASYNC_UPLOAD_THRESHOLD_BYTES",
             "async_upload_threshold_bytes",
+        ),
+    )
+    max_upload_size_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias=AliasChoices(
+            "MAX_UPLOAD_SIZE_BYTES",
+            "max_upload_size_bytes",
+        ),
+    )
+    upload_dir: str = Field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "querypilot_uploads"),
+        validation_alias=AliasChoices("UPLOAD_DIR", "upload_dir"),
+    )
+    worker_job_timeout_seconds: int = Field(
+        default=1800,
+        ge=60,
+        validation_alias=AliasChoices(
+            "WORKER_JOB_TIMEOUT_SECONDS",
+            "worker_job_timeout_seconds",
         ),
     )
     api_host: str = Field(
