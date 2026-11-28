@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import random
 import re
+from typing import Any
 
 import pandas as pd
 from sqlalchemy import Engine, create_engine, event, inspect, text
@@ -41,7 +42,7 @@ def _create_pair(
     database_url: str,
     read_database_url: str | None = None,
 ) -> tuple[Engine, Engine]:
-    """Create pooled PostgreSQL engine pair (with optional read-only role) or SQLite pair."""
+    """Create pooled PostgreSQL engine pair (requiring READ_DATABASE_URL) or SQLite pair."""
     if database_url.startswith("sqlite"):
         _ensure_sqlite_parent_dir(database_url)
         connect_args = {"check_same_thread": False}
@@ -54,22 +55,28 @@ def _create_pair(
 
         return write_eng, read_eng
 
+    read_url = (read_database_url or "").strip()
+    if not read_url:
+        raise RuntimeError(
+            "READ_DATABASE_URL is required when DATABASE_URL is PostgreSQL. "
+            "Provision a least-privilege role (infra/init-readonly-role.sql) and set READ_DATABASE_URL."
+        )
+    if read_url.startswith("sqlite"):
+        raise RuntimeError("READ_DATABASE_URL must be a PostgreSQL URL when DATABASE_URL is PostgreSQL.")
+
     pg_eng = create_engine(
         database_url,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_pre_ping=True,
     )
-    read_url = (read_database_url or "").strip()
-    if read_url and read_url != database_url:
-        read_pg_eng = create_engine(
-            read_url,
-            pool_size=settings.db_pool_size,
-            max_overflow=settings.db_max_overflow,
-            pool_pre_ping=True,
-        )
-        return pg_eng, read_pg_eng
-    return pg_eng, pg_eng
+    read_pg_eng = create_engine(
+        read_url,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_pre_ping=True,
+    )
+    return pg_eng, read_pg_eng
 
 
 def configure_database(
@@ -139,11 +146,120 @@ def get_readonly_role(
     return read_user
 
 
-def grant_readonly_select(table_name: str, target_engine: Engine | None = None) -> bool:
-    """Grant SELECT on a single business/tenant table to the configured read-only DB role."""
+def tenant_role_name(user_id: int) -> str:
+    """Return the deterministic PostgreSQL NOLOGIN role name for a tenant user ID."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 0:
+        raise ValueError("user_id must be a non-negative integer.")
+    return f"qp_tenant_{user_id}"
+
+
+def _provision_tenant_role_sql(
+    executor: Any,
+    user_id: int,
+    reader_role: str | None = None,
+    existing_tables: set[str] | None = None,
+) -> str:
+    """Create qp_tenant_{id} NOLOGIN and grant schema USAGE, core SELECT, and reader membership."""
+    role_name = tenant_role_name(user_id)
+    executor.execute(
+        text(
+            f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role_name}') THEN
+                    CREATE ROLE {role_name} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
+    executor.execute(text(f"GRANT USAGE ON SCHEMA public TO {role_name};"))
+    core_targets = (
+        sorted(CORE_TABLES & existing_tables)
+        if existing_tables is not None
+        else sorted(CORE_TABLES)
+    )
+    if core_targets:
+        quoted_core = ", ".join(core_targets)
+        executor.execute(text(f"GRANT SELECT ON {quoted_core} TO {role_name};"))
+
+    grant_to_role = reader_role or get_readonly_role()
+    if grant_to_role and _PG_IDENT_RE.match(grant_to_role):
+        reader_exists = executor.execute(
+            text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+            {"role": grant_to_role},
+        ).scalar()
+        if reader_exists:
+            executor.execute(text(f'GRANT {role_name} TO "{grant_to_role}";'))
+    return role_name
+
+
+def ensure_tenant_role(
+    user_id: int,
+    target_engine: Engine | None = None,
+    executor: Any | None = None,
+) -> bool:
+    """Create qp_tenant_{id} NOLOGIN on PostgreSQL and grant shared core-table SELECT."""
+    eng = target_engine or get_engine()
+    if not is_postgres(eng):
+        return False
+    reader_role = get_readonly_role()
+    if executor is not None:
+        _provision_tenant_role_sql(executor, user_id, reader_role=reader_role)
+        return True
+    try:
+        with eng.begin() as conn:
+            _provision_tenant_role_sql(conn, user_id, reader_role=reader_role)
+        return True
+    except SQLAlchemyError as exc:
+        logger.warning("Unable to provision tenant role for user %s: %s", user_id, exc)
+        raise
+
+
+def grant_readonly_select(
+    table_name: str,
+    target_engine: Engine | None = None,
+    user_id: int | None = None,
+) -> bool:
+    """Grant SELECT on a tenant table ONLY to qp_tenant_{id} (or core table to shared reader)."""
     eng = target_engine or get_engine()
     if not is_postgres(eng) or table_name in INTERNAL_TABLES or not _PG_IDENT_RE.match(table_name):
         return False
+
+    tenant_match = USER_TABLE_PREFIX_RE.match(table_name)
+    if tenant_match:
+        owner_id = int(tenant_match.group(1))
+        if user_id is not None and int(user_id) != owner_id:
+            raise ValueError(
+                f"Tenant table '{table_name}' does not match user_id={user_id}."
+            )
+        target_role = tenant_role_name(owner_id)
+        reader_role = get_readonly_role()
+        try:
+            with eng.begin() as conn:
+                ensure_tenant_role(owner_id, target_engine=eng, executor=conn)
+                conn.execute(text(f'GRANT SELECT ON TABLE "{table_name}" TO {target_role};'))
+                if reader_role and _PG_IDENT_RE.match(reader_role):
+                    reader_exists = conn.execute(
+                        text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                        {"role": reader_role},
+                    ).scalar()
+                    if reader_exists:
+                        conn.execute(text(f'REVOKE ALL ON TABLE "{table_name}" FROM "{reader_role}";'))
+            return True
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "Unable to grant SELECT on '%s' to tenant role '%s': %s",
+                table_name,
+                target_role,
+                exc,
+            )
+            return False
+
+    if table_name not in CORE_TABLES:
+        return False
+
     role = get_readonly_role()
     if not role:
         return False
@@ -163,34 +279,63 @@ def grant_readonly_select(table_name: str, target_engine: Engine | None = None) 
         return False
 
 
-def sync_readonly_role_privileges(target_engine: Engine | None = None) -> None:
-    """Enforce least-privilege SELECT grants on public/tenant tables and revoke internal tables."""
+def sync_readonly_role_privileges(target_engine: Engine | None = None) -> list[int]:
+    """Enforce per-tenant qp_tenant_{id} roles, core grants, and internal/tenant isolation."""
     eng = target_engine or get_engine()
     if not is_postgres(eng):
-        return
+        return []
     role = get_readonly_role()
-    if not role:
-        return
     inspector = inspect(eng)
     existing = set(inspector.get_table_names())
+    tenant_ids: set[int] = set()
+    tenant_tables_by_owner: dict[int, list[str]] = {}
+    for tbl in sorted(existing):
+        if not _PG_IDENT_RE.match(tbl):
+            continue
+        match = USER_TABLE_PREFIX_RE.match(tbl)
+        if match:
+            owner_id = int(match.group(1))
+            tenant_ids.add(owner_id)
+            tenant_tables_by_owner.setdefault(owner_id, []).append(tbl)
+
     try:
         with eng.begin() as conn:
-            exists = conn.execute(
-                text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
-                {"role": role},
-            ).scalar()
-            if not exists:
-                return
-            conn.execute(text(f'GRANT USAGE ON SCHEMA public TO "{role}";'))
-            for tbl in sorted(existing):
-                if not _PG_IDENT_RE.match(tbl):
-                    continue
-                if tbl in INTERNAL_TABLES:
-                    conn.execute(text(f'REVOKE ALL ON TABLE "{tbl}" FROM "{role}";'))
-                elif tbl in CORE_TABLES or USER_TABLE_PREFIX_RE.match(tbl):
-                    conn.execute(text(f'GRANT SELECT ON TABLE "{tbl}" TO "{role}";'))
+            if "users" in existing:
+                user_rows = conn.execute(text("SELECT id FROM users ORDER BY id")).scalars().all()
+                tenant_ids.update(int(uid) for uid in user_rows)
+
+            reader_exists = bool(
+                role
+                and conn.execute(
+                    text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                    {"role": role},
+                ).scalar()
+            )
+            if reader_exists and role is not None:
+                conn.execute(text(f'GRANT USAGE ON SCHEMA public TO "{role}";'))
+                for tbl in sorted(existing):
+                    if not _PG_IDENT_RE.match(tbl):
+                        continue
+                    if tbl in INTERNAL_TABLES or USER_TABLE_PREFIX_RE.match(tbl):
+                        conn.execute(text(f'REVOKE ALL ON TABLE "{tbl}" FROM "{role}";'))
+                    elif tbl in CORE_TABLES:
+                        conn.execute(text(f'GRANT SELECT ON TABLE "{tbl}" TO "{role}";'))
+
+            for uid in sorted(tenant_ids):
+                tenant_role = _provision_tenant_role_sql(
+                    conn,
+                    uid,
+                    reader_role=role,
+                    existing_tables=existing,
+                )
+                for internal_tbl in sorted(INTERNAL_TABLES & existing):
+                    conn.execute(text(f'REVOKE ALL ON TABLE "{internal_tbl}" FROM {tenant_role};'))
+                for owned_tbl in tenant_tables_by_owner.get(uid, []):
+                    conn.execute(text(f'GRANT SELECT ON TABLE "{owned_tbl}" TO {tenant_role};'))
+        return sorted(tenant_ids)
     except SQLAlchemyError as exc:
-        logger.warning("Unable to sync read-only role '%s' privileges: %s", role, exc)
+        logger.warning("Unable to sync read-only / tenant role privileges: %s", exc)
+        return []
 
 
 def ensure_vector_extension(target_engine: Engine | None = None) -> None:

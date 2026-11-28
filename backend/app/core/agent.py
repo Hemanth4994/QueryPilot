@@ -219,29 +219,6 @@ def _is_insufficient_schema(df: pd.DataFrame | None, sql_query: str) -> bool:
     return False
 
 
-def process_user_question(question: str) -> tuple[pd.DataFrame | None, str, str | None]:
-    """Run the 2-stage Text-to-SQL + self-correction pipeline returning (df, sql, error)."""
-    sql_query, _ = get_sql_query_from_text_with_model(question)
-    df, error, _ = execute_sql_bounded(sql_query)
-
-    if error:
-        schema = get_schema_for_llm()
-        correction_prompt = f"""
-        You wrote this SQL query: {sql_query}
-        It failed in the database with this exact error: {error}
-
-        Here is the Schema again:
-        {schema}
-
-        Fix the SQL query based on the error. RETURN ONLY THE RAW CORRECTED SQL.
-        """
-        raw_corrected, _, _, _ = generate_with_retry_telemetry(correction_prompt)
-        sql_query = strip_sql_fences(raw_corrected)
-        df, error, _ = execute_sql_bounded(sql_query)
-
-    return df, sql_query, error
-
-
 def _finalize_and_emit(
     response: QueryResponse,
     user_id: int | None,

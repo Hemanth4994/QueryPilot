@@ -6,7 +6,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from ..config import settings
-from .database import INTERNAL_TABLES, get_read_engine
+from .database import INTERNAL_TABLES, get_read_engine, tenant_role_name
 
 FORBIDDEN_KEYWORDS = (
     "INSERT",
@@ -78,6 +78,20 @@ FORBIDDEN_FUNCTIONS = frozenset(
         "dblink",
         "dblink_exec",
         "query_to_xml",
+        "query_to_xmlschema",
+        "query_to_xml_and_xmlschema",
+        "table_to_xml",
+        "table_to_xmlschema",
+        "table_to_xml_and_xmlschema",
+        "schema_to_xml",
+        "schema_to_xmlschema",
+        "schema_to_xml_and_xmlschema",
+        "cursor_to_xml",
+        "cursor_to_xmlschema",
+        "cursor_to_xml_and_xmlschema",
+        "database_to_xml",
+        "database_to_xmlschema",
+        "database_to_xml_and_xmlschema",
     }
 )
 
@@ -319,9 +333,15 @@ def _extract_referenced_tables(ident_sql: str) -> tuple[list[tuple[str | None, s
         tok = tokens[i]
         upper = tok.upper()
 
-        # Check forbidden functions like pg_read_file(...)
-        if i + 1 < n and tokens[i + 1] == "(" and tok.lower() in FORBIDDEN_FUNCTIONS:
-            return [], cte_names, f"Security Error: Forbidden SQL function '{tok}' is not permitted."
+        # Check forbidden functions like pg_read_file(...) and XML dump functions
+        if i + 1 < n and tokens[i + 1] == "(":
+            func_name = tok.lower().rsplit(".", 1)[-1]
+            if (
+                func_name in FORBIDDEN_FUNCTIONS
+                or "_to_xml" in func_name
+                or "_to_xmlschema" in func_name
+            ):
+                return [], cte_names, f"Security Error: Forbidden SQL function '{tok}' is not permitted."
 
         if tok == "(":
             prev_upper = tokens[i - 1].upper() if i > 0 else ""
@@ -519,6 +539,9 @@ def execute_sql_bounded(
             if is_pg:
                 with conn.begin():
                     conn.execute(text("SET LOCAL TRANSACTION READ ONLY"))
+                    if user_id is not None:
+                        role_name = tenant_role_name(user_id)
+                        conn.execute(text(f"SET LOCAL ROLE {role_name}"))
                     conn.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
                     result = conn.execute(text(exec_query))
                     columns = list(result.keys())

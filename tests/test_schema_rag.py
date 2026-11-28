@@ -49,6 +49,23 @@ def test_cross_tenant_sql_guard_blocks_other_users_and_internal_tables():
         "SELECT * FROM pg_catalog.pg_tables;",
         "SELECT pg_read_file('/etc/passwd');",
         "SELECT * FROM unauthorized_table;",
+        # XML / cursor / database export functions capable of evaluating arbitrary SQL or table names
+        "SELECT table_to_xml('users', false, true, '');",
+        "SELECT query_to_xml_and_xmlschema('SELECT email, hashed_password FROM users', false, true, '');",
+        "SELECT query_to_xml('SELECT * FROM u_1_sales', false, true, '');",
+        "SELECT schema_to_xml('public', false, true, '');",
+        "SELECT cursor_to_xml('cur', 10, false, true, '');",
+        "SELECT database_to_xml(false, true, '');",
+        "SELECT query_to_xmlschema('SELECT * FROM users', false, true, '');",
+        "SELECT table_to_xmlschema('users', false, true, '');",
+        "SELECT table_to_xml_and_xmlschema('users', false, true, '');",
+        "SELECT schema_to_xmlschema('public', false, true, '');",
+        "SELECT schema_to_xml_and_xmlschema('public', false, true, '');",
+        "SELECT cursor_to_xmlschema('cur', 10, false, true, '');",
+        "SELECT cursor_to_xml_and_xmlschema('cur', 10, false, true, '');",
+        "SELECT database_to_xmlschema(false, true, '');",
+        "SELECT database_to_xml_and_xmlschema(false, true, '');",
+        "SELECT pg_catalog.table_to_xml('users', false, true, '');",
     ]
     for sql in blocked_queries:
         err = sql_guard.validate_read_only_sql(sql, user_id=2, allowed_tables=allowed)
@@ -154,25 +171,40 @@ def test_postgres_execution_applies_read_only_timeout_and_row_cap(monkeypatch):
     assert executed_sql[2] == "SELECT id FROM orders"
     mock_result.fetchmany.assert_called_once_with(3)
 
+    executed_sql.clear()
+    df_tenant, err_tenant, _ = sql_guard.execute_sql_bounded("SELECT id FROM orders;", user_id=7)
+    assert err_tenant is None
+    assert len(df_tenant) == 2
+    assert executed_sql[0] == "SET LOCAL TRANSACTION READ ONLY"
+    assert executed_sql[1] == "SET LOCAL ROLE qp_tenant_7"
+    assert executed_sql[2] == "SET LOCAL statement_timeout = 4321"
+    assert executed_sql[3] == "SELECT id FROM orders"
+
 
 def test_postgres_pooling_vector_extension_and_cosine_query(monkeypatch):
-    captured_create_engine: dict = {}
+    import pytest
+
+    captured_create_engine: list[dict] = []
 
     def fake_create_engine(url, **kwargs):
-        captured_create_engine["url"] = url
-        captured_create_engine["kwargs"] = kwargs
+        captured_create_engine.append({"url": url, "kwargs": kwargs})
         fake_eng = MagicMock()
         fake_eng.dialect.name = "postgresql"
         return fake_eng
 
     monkeypatch.setattr(database, "create_engine", fake_create_engine)
-    write_eng, read_eng = database._create_pair(
-        "postgresql+psycopg://querypilot:querypilot@db:5432/querypilot"
-    )
-    assert write_eng is read_eng
-    assert captured_create_engine["kwargs"]["pool_pre_ping"] is True
-    assert captured_create_engine["kwargs"]["pool_size"] == settings.db_pool_size
-    assert captured_create_engine["kwargs"]["max_overflow"] == settings.db_max_overflow
+    write_url = "postgresql+psycopg://querypilot:querypilot@db:5432/querypilot"
+    read_url = "postgresql+psycopg://querypilot_reader:rpass@db:5432/querypilot"
+
+    with pytest.raises(RuntimeError, match="READ_DATABASE_URL is required"):
+        database._create_pair(write_url)
+
+    write_eng, read_eng = database._create_pair(write_url, read_database_url=read_url)
+    assert write_eng is not read_eng
+    assert captured_create_engine[0]["kwargs"]["pool_pre_ping"] is True
+    assert captured_create_engine[0]["kwargs"]["pool_size"] == settings.db_pool_size
+    assert captured_create_engine[0]["kwargs"]["max_overflow"] == settings.db_max_overflow
+    assert captured_create_engine[1]["url"] == read_url
 
     mock_conn = MagicMock()
     write_eng.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
@@ -247,7 +279,11 @@ def test_dedicated_readonly_database_url_creates_separate_read_engine_and_grants
 
         assert database.grant_readonly_select("u_1_targets", target_engine=write_eng) is True
         grant_sqls = [str(call.args[0]) for call in mock_conn.execute.call_args_list]
-        assert any('GRANT SELECT ON TABLE "u_1_targets" TO "querypilot_reader"' in s for s in grant_sqls)
+        assert any("CREATE ROLE qp_tenant_1 NOLOGIN" in s for s in grant_sqls)
+        assert any("GRANT qp_tenant_1 TO \"querypilot_reader\"" in s for s in grant_sqls)
+        assert any('GRANT SELECT ON TABLE "u_1_targets" TO qp_tenant_1' in s for s in grant_sqls)
+        assert any('REVOKE ALL ON TABLE "u_1_targets" FROM "querypilot_reader"' in s for s in grant_sqls)
+        assert not any('GRANT SELECT ON TABLE "u_1_targets" TO "querypilot_reader"' in s for s in grant_sqls)
         assert database.grant_readonly_select("users", target_engine=write_eng) is False
     finally:
         settings.read_database_url = prev_read_url

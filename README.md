@@ -52,7 +52,7 @@ Copy `.env.example` to `.env` before running:
 | `JWT_EXPIRE_MINUTES` | `60` | Access token lifetime in minutes |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `querypilot` | PostgreSQL container credentials |
 | `DATABASE_URL` | `postgresql+psycopg://querypilot:querypilot@localhost:5432/querypilot` | SQLAlchemy PostgreSQL write/auth connection URL |
-| `READ_DATABASE_URL` | `""` *(falls back to `DATABASE_URL`)* | Optional least-privilege read-only PostgreSQL URL for executing generated SQL |
+| `READ_DATABASE_URL` | *(required on PostgreSQL)* | Dedicated least-privilege read-only PostgreSQL URL (`querypilot_reader`) for executing generated SQL |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis URL for caching, rate limiting, and ARQ |
 | `CACHE_TTL_SECONDS` | `300` | Schema and query cache TTL |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Max query/upload requests per user per minute |
@@ -84,15 +84,23 @@ docker compose up --build
 - **Streamlit UI:** `http://localhost:8501`
 - **Backend Health:** `http://localhost:8000/api/v1/health`
 
-### Production Hardening: Dedicated Read-Only DB Role
+### Production Hardening: Per-User Roles & Mandatory Read-Only Connection
 
-When hosting QueryPilot publicly, pair transaction-level `SET LOCAL TRANSACTION READ ONLY` with a dedicated PostgreSQL role (`READ_DATABASE_URL`) that only holds `SELECT` on shared demo and uploaded tenant tables (`u_*`) and zero privileges on `users` or `schema_embeddings`:
+When `DATABASE_URL` points to PostgreSQL, QueryPilot **requires `READ_DATABASE_URL`** to be configured and refuses to start if it is empty so generated SQL never runs as the write/auth database owner. Isolation is enforced directly by PostgreSQL via per-user roles:
 
-1. Provision the role using [infra/init-readonly-role.sql](infra/init-readonly-role.sql) (update the placeholder password first):
+1. **Provision the `NOINHERIT` shared login role (`querypilot_reader`)** using [infra/init-readonly-role.sql](infra/init-readonly-role.sql), then set a strong password (`ALTER ROLE querypilot_reader WITH PASSWORD '...'`):
    ```bash
    psql -U querypilot -d querypilot -f infra/init-readonly-role.sql
    ```
-2. Set `READ_DATABASE_URL=postgresql+psycopg://querypilot_reader:<password>@db:5432/querypilot` in `.env`. QueryPilot will execute generated SQL exclusively via `READ_DATABASE_URL` and automatically run `GRANT SELECT` for newly uploaded tenant tables while keeping `users` and `schema_embeddings` revoked.
+2. **Set `READ_DATABASE_URL`** in `.env` (for example `postgresql+psycopg://querypilot_reader:<password>@db:5432/querypilot`).
+3. **Per-user `qp_tenant_{id}` NOLOGIN roles:**
+   - At user registration (`register_user`), PostgreSQL creates `qp_tenant_{id} NOLOGIN`, grants `USAGE` on `public` and `SELECT` on shared demo tables (`customers`, `products`, `orders`), and grants membership of `qp_tenant_{id}` to `querypilot_reader` (`NOINHERIT`).
+   - At CSV upload (`grant_readonly_select`), `SELECT` on the new `u_{id}_*` table is granted **only** to `qp_tenant_{id}` — never to `querypilot_reader` or other tenants — and internal tables (`users`, `schema_embeddings`) remain revoked.
+   - At query execution (`execute_sql_bounded`), QueryPilot runs `SET LOCAL TRANSACTION READ ONLY` immediately followed by `SET LOCAL ROLE qp_tenant_{user_id}` and `SET LOCAL statement_timeout`, so PostgreSQL refuses cross-tenant reads and internal-table leaks (even via text-taking functions like `query_to_xml` or `table_to_xml`) with `permission denied`.
+4. **Existing deployments:** Run [infra/backfill_tenant_roles.py](infra/backfill_tenant_roles.py) to create `qp_tenant_{id}` roles and tighten `SELECT` / `REVOKE` privileges for existing users and `u_{id}_*` tables:
+   ```bash
+   python infra/backfill_tenant_roles.py
+   ```
 
 ## Local Development, Tests & Evaluations
 

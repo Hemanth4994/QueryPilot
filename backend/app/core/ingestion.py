@@ -310,7 +310,7 @@ def ingest_csv_file(
             eng=eng,
         )
 
-    grant_readonly_select(table_name)
+    grant_readonly_select(table_name, user_id=user_id)
 
     try:
         embedding_indexed = upsert_table_embedding(table_name, owner_id=user_id, force=True)

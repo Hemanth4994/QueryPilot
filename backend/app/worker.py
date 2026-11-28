@@ -24,7 +24,12 @@ from .core.cache import (
     save_job_state,
     set_cached_query,
 )
-from .core.database import check_and_seed_db, configure_database, get_schema_for_llm
+from .core.database import (
+    check_and_seed_db,
+    configure_database,
+    get_schema_for_llm,
+    sync_readonly_role_privileges,
+)
 from .core.ingestion import ingest_csv_bytes, ingest_csv_file
 from .core.schema_rag import ensure_schema_embeddings_table
 from .core.telemetry import QueryTelemetryEvent, emit_query_telemetry, trace_query_span
@@ -217,6 +222,7 @@ async def startup(_ctx: dict[str, Any]) -> None:
     check_and_seed_db()
     ensure_users_table()
     ensure_schema_embeddings_table()
+    sync_readonly_role_privileges()
 
 
 async def shutdown(_ctx: dict[str, Any]) -> None:

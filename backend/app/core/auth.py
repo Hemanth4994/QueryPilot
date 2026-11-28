@@ -12,7 +12,7 @@ from sqlalchemy import DateTime, Engine, Integer, String, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from ..config import settings
-from .database import get_engine
+from .database import ensure_tenant_role, get_engine, is_postgres
 
 
 class AuthBase(DeclarativeBase):
@@ -109,6 +109,9 @@ def register_user(email: str, password: str, target_engine: Engine | None = None
             hashed_password=hash_password(password),
         )
         session.add(user)
+        session.flush()
+        if is_postgres(eng):
+            ensure_tenant_role(user.id, target_engine=eng, executor=session)
         session.commit()
         session.refresh(user)
         return user

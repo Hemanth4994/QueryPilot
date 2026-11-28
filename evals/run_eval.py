@@ -25,6 +25,7 @@ from backend.app.core.database import (  # noqa: E402
     CORE_TABLES,
     check_and_seed_db,
     configure_database,
+    ensure_tenant_role,
     is_postgres,
 )
 from backend.app.core.schema_rag import (  # noqa: E402
@@ -422,11 +423,15 @@ def _setup_database(mode: str, database_url: str | None) -> tempfile.TemporaryDi
         settings.database_url = database_url
         configure_database(database_url)
         check_and_seed_db()
+        if is_postgres():
+            ensure_tenant_role(1)
         return None
 
     if "DATABASE_URL" in os.environ or "DB_URL" in os.environ:
         configure_database(settings.database_url)
         check_and_seed_db()
+        if is_postgres():
+            ensure_tenant_role(1)
         return None
 
     if mode == "offline":
@@ -440,6 +445,8 @@ def _setup_database(mode: str, database_url: str | None) -> tempfile.TemporaryDi
 
     configure_database(settings.database_url)
     check_and_seed_db()
+    if is_postgres():
+        ensure_tenant_role(1)
     return None
 
 

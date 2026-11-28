@@ -44,4 +44,5 @@ def isolated_session_db(tmp_path_factory):
     settings.jwt_secret_key = original_jwt_secret
     if original_env_key is not None:
         os.environ["GEMINI_API_KEY"] = original_env_key
-    configure_database(original_url)
+    if original_url.startswith("sqlite") or original_read_url.strip():
+        configure_database(original_url, read_database_url=original_read_url)
