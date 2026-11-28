@@ -35,14 +35,13 @@ def live_pg_engines():
     write_url, read_url = urls
     prev_db_url = settings.database_url
     prev_read_url = settings.read_database_url
-    settings.database_url = write_url
-    settings.read_database_url = read_url
-    database.configure_database(write_url, read_database_url=read_url)
-    database.check_and_seed_db()
-    auth.ensure_users_table()
-    database.sync_readonly_role_privileges()
-
     try:
+        settings.database_url = write_url
+        settings.read_database_url = read_url
+        database.configure_database(write_url, read_database_url=read_url)
+        database.check_and_seed_db()
+        auth.ensure_users_table()
+        database.sync_readonly_role_privileges()
         yield database.get_engine(), database.get_read_engine()
     finally:
         settings.database_url = prev_db_url
@@ -101,13 +100,17 @@ def test_postgres_per_tenant_roles_block_leaks_at_db_layer_and_allow_own_table(l
         assert own_df is not None
         assert own_df.to_dict(orient="records") == [{"metric": "q1_arr", "revenue": 4200.5}]
 
-        # Text guard must ALSO reject all three leaking XML queries upfront
+        # Text guard must ALSO reject all three leaking XML queries and broad XML dumps upfront
         leaking_queries = [
             "SELECT table_to_xml('users', false, true, '');",
             "SELECT query_to_xml_and_xmlschema('SELECT id, email, hashed_password FROM users', false, true, '');",
             f"""SELECT query_to_xml('SELECT * FROM "{u2_table}"', false, true, '');""",
         ]
-        for query in leaking_queries:
+        schema_dump_queries = [
+            "SELECT schema_to_xml('public', false, true, '');",
+            "SELECT database_to_xml(false, true, '');",
+        ]
+        for query in [*leaking_queries, *schema_dump_queries]:
             guard_err = sql_guard.validate_read_only_sql(
                 query,
                 user_id=user1.id,
@@ -116,14 +119,9 @@ def test_postgres_per_tenant_roles_block_leaks_at_db_layer_and_allow_own_table(l
             assert guard_err is not None and "Security Error" in guard_err
 
         # Even bypassing validate_read_only_sql completely, PostgreSQL itself must deny all 3 leaks
-        # (and schema_to_xml / direct cross-tenant reads) under SET LOCAL ROLE qp_tenant_{user1.id}
-        bypass_leaking_queries = [
-            *leaking_queries,
-            "SELECT schema_to_xml('public', false, true, '');",
-            "SELECT database_to_xml(false, true, '');",
-        ]
+        # under SET LOCAL ROLE qp_tenant_{user1.id}, and schema/database dumps omit inaccessible tables.
         role1 = database.tenant_role_name(user1.id)
-        for query in bypass_leaking_queries:
+        for query in leaking_queries:
             with read_eng.connect() as conn:
                 with pytest.raises(SQLAlchemyError) as exc_info:
                     with conn.begin():
@@ -133,6 +131,18 @@ def test_postgres_per_tenant_roles_block_leaks_at_db_layer_and_allow_own_table(l
                 assert "permission denied" in str(exc_info.value).lower(), (
                     f"Expected PostgreSQL permission denied for {query!r}, got: {exc_info.value}"
                 )
+
+        for dump_query in schema_dump_queries:
+            with read_eng.connect() as conn:
+                with conn.begin():
+                    conn.execute(text("SET LOCAL TRANSACTION READ ONLY"))
+                    conn.execute(text(f"SET LOCAL ROLE {role1}"))
+                    xml_output = str(conn.execute(text(dump_query)).scalar() or "")
+            assert u1_table in xml_output and "q1_arr" in xml_output
+            assert u2_table not in xml_output
+            assert "tenant_2_confidential" not in xml_output
+            assert f"pg_iso_u2_{suffix}" not in xml_output
+            assert "<users>" not in xml_output and "<schema_embeddings>" not in xml_output
     finally:
         with write_eng.begin() as conn:
             if u1_table:
